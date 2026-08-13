@@ -2424,13 +2424,24 @@ class PriceParserWithSheets:
             # Настраиваем время ожидания в зависимости от сайта
             if 'bestly.ru' in url:
                 wait_time = wait_time or 20  # Увеличиваем ожидание для Bestly
-                logger.info(f"Ожидание загрузки Bestly: {wait_time} секунд...")
-                
-                # Ждем загрузки страницы
-                time.sleep(wait_time)
-                
+                logger.info(f"Ожидание загрузки Bestly: до {wait_time} секунд...")
+
+                # Вместо слепого time.sleep(wait_time) ждем появления хотя бы
+                # одного элемента, похожего на цену/таблицу — обычно это
+                # происходит быстрее верхней границы, а на медленных
+                # страницах мы всё равно ждем не дольше, чем раньше.
+                try:
+                    WebDriverWait(self.driver, wait_time).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, 'table, [class*="price"], [class*="Price"], [data-price]')
+                        )
+                    )
+                except TimeoutException:
+                    logger.warning(f"Не дождались признаков цены за {wait_time}с, продолжаем как есть")
+
                 # Прокручиваем несколько раз для загрузки динамического контента
                 scroll_attempts = 8  # Увеличиваем количество прокруток
+                found_prices_during_scroll = False
                 for i in range(scroll_attempts):
                     try:
                         # Прокручиваем страницу
@@ -2439,20 +2450,23 @@ class PriceParserWithSheets:
                         self.driver.execute_script(f"window.scrollTo(0, {current_scroll});")
                         logger.info(f"Прокрутка {i+1}/{scroll_attempts} до позиции {current_scroll}")
                         time.sleep(4)  # Увеличиваем ожидание после прокрутки
-                        
+
                         # Пробуем найти элементы с ценами
                         price_elements = self.driver.find_elements(By.CSS_SELECTOR, '[class*="price"], [class*="Price"], [data-price], .price, .Price')
                         if price_elements and i >= 3:  # Если нашли цены после 4-й прокрутки
                             logger.info(f"Найдено {len(price_elements)} элементов с ценами после прокрутки")
+                            found_prices_during_scroll = True
                             break
-                            
+
                     except Exception as e:
                         logger.warning(f"Ошибка при прокрутке: {e}")
                         continue
-                
-                # Дополнительное ожидание для динамического контента
-                time.sleep(8)
-                
+
+                # Дополнительное ожидание для динамического контента.
+                # Если цены уже найдены во время прокрутки — не ждем полные
+                # 8 секунд впустую, короткой паузы достаточно.
+                time.sleep(2 if found_prices_during_scroll else 8)
+
                 # Пробуем кликнуть на кнопки "Показать еще" или аналогичные
                 try:
                     show_more_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'Показать') or contains(text(), 'Еще') or contains(text(), 'Загрузить') or contains(text(), 'Показать еще')]")
@@ -2469,7 +2483,12 @@ class PriceParserWithSheets:
             else:
                 # Для других сайтов используем стандартное ожидание
                 wait_time = wait_time or 10
-                time.sleep(wait_time)
+                try:
+                    WebDriverWait(self.driver, wait_time).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                except TimeoutException:
+                    logger.warning(f"Страница не сообщила о готовности за {wait_time}с, продолжаем как есть")
                 self.driver.execute_script("window.scrollTo(0, 500);")
                 time.sleep(2)
             
