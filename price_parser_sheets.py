@@ -3,12 +3,19 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import os
 import re
 import math
+import json
+import hashlib
+import traceback
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException
@@ -16,18 +23,141 @@ from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 import warnings
-warnings.filterwarnings('ignore')
+# Подавляем только известный шумный DeprecationWarning от openpyxl/pandas,
+# а не все предупреждения подряд — иначе можно пропустить реальную проблему
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-# Настройка логирования
+# Настройка логирования. Лог-файл ротируется, чтобы не расти бесконечно
+# при регулярных запусках парсера.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('price_parser.log', encoding='utf-8'),
+        RotatingFileHandler('price_parser.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ==========================================================================
+# Справочные данные для эвристик парсинга.
+# Раньше эти списки были разбросаны по телам методов — вынесены сюда,
+# чтобы их можно было править в одном месте, не копаясь в коде парсера.
+# ==========================================================================
+
+# Цвета, которые ищем в названии товара (extract_color_from_product_name)
+COLOR_KEYWORDS = [
+    'прозрачный', 'матовый', 'белый', 'цветной',
+    'бронза', 'молочный', 'голубой', 'зеленый',
+    'красный', 'желтый', 'черный', 'синий',
+    'оранжевый', 'фиолетовый', 'коричневый',
+]
+
+# Сокращения/варианты написания цвета -> полное название
+COLOR_VARIATIONS = {
+    'мат': 'матовый',
+    'прозр': 'прозрачный',
+    'бел': 'белый',
+    'цвет': 'цветной',
+}
+
+# Тип материала по ключевому слову в названии (extract_material_type_from_product_name)
+MATERIAL_TYPE_KEYWORDS = {
+    'поликарбонат': 'поликарбонат',
+    'polygal': 'поликарбонат',
+    'оргстекло': 'оргстекло',
+    'орг.стекло': 'оргстекло',
+    'акрил': 'акрил',
+    'пластик': 'пластик',
+    'пвх': 'пвх',
+    'пенопласт': 'пенопласт',
+    'дерево': 'дерево',
+    'металл': 'металл',
+    'алюминий': 'алюминий',
+    'сталь': 'сталь',
+    'стекло': 'стекло',
+}
+
+# Известные бренды/марки (extract_brand_from_product_name)
+KNOWN_BRANDS = [
+    'polygal', 'plazcryl', 'акрилекс', 'моногал', 'легпром',
+    'полигаль', 'плазкрил', 'akrilux', 'monogal',
+]
+
+# Тип продукта по ключевому слову (extract_product_type_from_product_name)
+PRODUCT_TYPE_KEYWORDS = {
+    'сотовый': 'сотовый',
+    'монолитный': 'монолитный',
+    'листовой': 'листовой',
+    'профилированный': 'профилированный',
+    'ячеистый': 'ячеистый',
+    'сот': 'сотовый',
+    'монолит': 'монолитный',
+}
+
+# Общие слова без смысловой нагрузки, исключаемые из ключевых слов
+# (extract_important_keywords)
+KEYWORD_STOP_WORDS = {
+    'на', 'и', 'в', 'с', 'для', 'по', 'из', 'от', 'до',
+    'мм', 'см', 'м', 'кг', 'г', 'л', 'шт', 'упак',
+    'лист', 'листа', 'листов', 'пластина', 'плита',
+}
+
+# Диапазоны "разумной" цены по товару (is_reasonable_price).
+# Правила проверяются по порядку, побеждает первое, где ВСЕ keywords
+# встречаются в названии товара (в нижнем регистре).
+PRODUCT_PRICE_RANGES = [
+    {
+        'keywords': ('поликарбонат', 'polygal', 'сотовый'),
+        'min': 5000, 'max': 20000,
+    },
+    {
+        'keywords': ('орг.стекло', 'plazcryl'),
+        'min': 5000, 'max': 30000,
+    },
+    {
+        'keywords': ('композитная панель',),
+        'min': 3000, 'max': 15000,
+    },
+]
+# Диапазон по умолчанию, если ни одно правило выше не подошло
+DEFAULT_PRICE_RANGE = (100, 50000)
+# Диапазон для случаев, когда название товара вообще не передано
+UNKNOWN_PRODUCT_PRICE_RANGE = (100, 100000)
+
+# Параметры трекинга рекламы/поисковиков, которые иногда попадают в ссылку
+# при копировании её из результатов поиска или рекламных кампаний
+# (например, https://site.ru/product/?ysclid=... после перехода из Яндекса).
+# Они не относятся к самому товару и их стоит убирать перед сохранением
+# и запросом ссылки — сайт отдаёт ту же страницу и без них.
+TRACKING_QUERY_PARAMS = {
+    'ysclid', 'yclid', 'gclid', 'fbclid', 'msclkid', '_openstat',
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+}
+
+
+def strip_tracking_params(url):
+    """
+    Убирает известные рекламные/поисковые трекинг-параметры (ysclid, utm_*
+    и т.п.) из URL, сохраняя остальные query-параметры как есть — некоторые
+    сайты используют их для выбора конкретного товара/варианта, и их
+    удалять нельзя.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+        filtered = [
+            (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key not in TRACKING_QUERY_PARAMS
+        ]
+        new_query = urlencode(filtered)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    except Exception:
+        return url
+
 
 def safe_str(value, default=''):
     """
@@ -43,7 +173,7 @@ def safe_str(value, default=''):
         if isinstance(value, float) and value != value:
             return default
         return str(value)
-    except:
+    except Exception:
         return default
 
 
@@ -59,6 +189,10 @@ class PriceParserWithSheets:
         self.results = []
         self.rounding_mode = 'ceil'  # Режим округления по умолчанию
         self.user_selections = {}  # Словарь для хранения выборов пользователя
+        # Финальный URL и статус последнего запроса через get_with_requests
+        # (см. этот метод — используется для самолечения "протухших" ссылок)
+        self.last_fetched_url = None
+        self.last_status_code = None
         
         # Загружаем сохраненные выборы пользователя при инициализации
         self.load_user_selections()
@@ -133,7 +267,6 @@ class PriceParserWithSheets:
         try:
             selections_file = 'user_selections.json'
             if os.path.exists(selections_file):
-                import json
                 with open(selections_file, 'r', encoding='utf-8') as f:
                     self.user_selections = json.load(f)
                 logger.info(f"Загружено {len(self.user_selections)} сохраненных выборов пользователя")
@@ -144,7 +277,6 @@ class PriceParserWithSheets:
     def save_user_selections(self):
         """Сохранение выборов пользователя в файл"""
         try:
-            import json
             selections_file = 'user_selections.json'
             with open(selections_file, 'w', encoding='utf-8') as f:
                 json.dump(self.user_selections, f, ensure_ascii=False, indent=2)
@@ -155,8 +287,13 @@ class PriceParserWithSheets:
     def save_user_selection(self, product_url, selector, text, price):
         """Сохранение выбора пользователя для конкретного товара"""
         try:
-            # Создаем уникальный ключ на основе URL и текста элемента
-            key = f"{product_url}_{hash(selector + text)}"
+            # Создаем стабильный ключ на основе URL и текста элемента.
+            # Важно использовать hashlib, а не встроенный hash(): для строк
+            # он рандомизируется на каждый запуск процесса (PYTHONHASHSEED),
+            # из-за чего один и тот же выбор сохранялся бы под новым ключом
+            # при каждом запуске скрипта, и user_selections.json бесконтрольно рос.
+            digest = hashlib.md5((selector + text).encode('utf-8')).hexdigest()
+            key = f"{product_url}_{digest}"
             
             self.user_selections[key] = {
                 'url': product_url,
@@ -232,7 +369,89 @@ class PriceParserWithSheets:
         except Exception as e:
             logger.error(f"Ошибка округления цены: {e}")
             return round(price, 2)  # Возвращаем просто округленную цену при ошибке
-    
+
+    # ----------------------------------------------------------------
+    # Общие вспомогательные методы для поиска толщины в тексте.
+    # Раньше практически идентичный набор regex-паттернов и цикл
+    # числового сравнения были продублированы более чем в 7 местах
+    # (find_best_match_by_thickness, calculate_match_score,
+    # debug_row_info, check_thickness_in_text,
+    # universal_table_parsing_bestly, parse_orgsteklo_table_improved,
+    # parse_bestly_orgsteklo_table). Теперь это одно место.
+    # ----------------------------------------------------------------
+
+    def _numbers_in_text(self, text):
+        """Извлекает все числа из текста в виде float (запятая -> точка)."""
+        numbers = []
+        if not text:
+            return numbers
+        for num_str in re.findall(r'\d+(?:[.,]\d+)?', text):
+            try:
+                numbers.append(float(num_str.replace(',', '.')))
+            except ValueError:
+                continue
+        return numbers
+
+    def _thickness_regex_patterns(self, thickness, mode='boundary'):
+        """
+        Возвращает regex-паттерны для поиска толщины в тексте.
+          'exact'    — ячейка таблицы целиком (^...$) плюс варианты с
+                       границей слова; используется при разборе табличных
+                       ячеек, где ожидается только значение толщины.
+          'boundary' — варианты с границей слова (\\b...\\b), включая
+                       "мм"/"mm", чтобы толщина "4" не совпадала как часть
+                       более длинного числа (например "14мм").
+        """
+        escaped = re.escape(str(thickness))
+        if mode == 'exact':
+            return [
+                f'^{escaped}\\s*мм$',
+                f'^{escaped}\\s*mm$',
+                f'^{escaped}$',
+                f'\\b{escaped}\\s*мм\\b',
+                f'\\b{escaped}\\s*mm\\b',
+                f'\\b{escaped}\\b',
+            ]
+        # 'boundary' (по умолчанию)
+        return [
+            f'\\b{escaped}\\s*мм\\b',
+            f'\\b{escaped}\\b',
+            f'\\b{escaped}\\s*mm\\b',
+        ]
+
+    def _thickness_regex_match(self, text, thickness, mode='boundary'):
+        """Проверяет текст только по regex-паттернам толщины (без числового fallback)."""
+        if not text or not thickness:
+            return False
+        text_lower = text.lower()
+        for pattern in self._thickness_regex_patterns(thickness, mode=mode):
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        return False
+
+    def _text_matches_thickness(self, text, thickness, mode='boundary', tolerance=0.1):
+        """
+        Проверяет, соответствует ли текст указанной толщине: сначала по
+        regex-паттернам (см. _thickness_regex_patterns), затем, если не
+        нашли, по числовому совпадению с заданным допуском.
+        """
+        if not text or not thickness:
+            return False
+
+        if self._thickness_regex_match(text, thickness, mode=mode):
+            return True
+
+        try:
+            thickness_val = float(thickness)
+        except (TypeError, ValueError):
+            return False
+
+        for num in self._numbers_in_text(text.lower()):
+            if abs(num - thickness_val) < tolerance:
+                return True
+
+        return False
+
     def extract_color_from_product_name(self, product_name):
         """
         Извлекает цвет из названия товара.
@@ -248,34 +467,19 @@ class PriceParserWithSheets:
             
             # Убираем лишние пробелы и приводим к нижнему регистру
             clean_name = product_name.lower().strip()
-            
-            # Список возможных цветов
-            colors = [
-                'прозрачный', 'матовый', 'белый', 'цветной', 
-                'бронза', 'молочный', 'голубой', 'зеленый', 
-                'красный', 'желтый', 'черный', 'синий',
-                'оранжевый', 'фиолетовый', 'коричневый'
-            ]
-            
+
             # Ищем цвет в названии
-            for color in colors:
+            for color in COLOR_KEYWORDS:
                 if color in clean_name:
                     logger.info(f"Извлечен цвет из названия '{product_name}': {color}")
                     return color
-            
+
             # Также проверяем возможные вариации
-            color_variations = {
-                'мат': 'матовый',
-                'прозр': 'прозрачный',
-                'бел': 'белый',
-                'цвет': 'цветной'
-            }
-            
-            for variation, full_color in color_variations.items():
+            for variation, full_color in COLOR_VARIATIONS.items():
                 if variation in clean_name:
                     logger.info(f"Извлечен цвет из вариации '{product_name}': {full_color}")
                     return full_color
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения цвета: {e}")
@@ -352,7 +556,7 @@ class PriceParserWithSheets:
             try:
                 self.driver.quit()
                 logger.info("Selenium драйвер закрыт")
-            except:
+            except Exception:
                 pass
             finally:
                 self.driver = None
@@ -431,7 +635,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка загрузки файла Excel: {e}")
-            import traceback
             traceback.print_exc()
             return False
     
@@ -455,7 +658,7 @@ class PriceParserWithSheets:
                     domain = domain[4:]
                 return domain
             return ''
-        except:
+        except Exception:
             return ''
     
     def extract_thickness_from_product_name(self, product_name):
@@ -520,7 +723,7 @@ class PriceParserWithSheets:
                     if 0.5 <= num <= 50:
                         logger.info(f"Извлечена толщина из цифр в названии '{product_name}': {num}мм")
                         return str(num)
-                except:
+                except Exception:
                     continue
             
             return None
@@ -693,46 +896,13 @@ class PriceParserWithSheets:
         try:
             logger.info(f"Ищем элемент с толщиной {thickness}мм среди {len(elements)} элементов")
             
-            # Конвертируем толщину в число для сравнения
-            try:
-                thickness_num = float(thickness)
-            except:
-                thickness_num = None
-            
             candidates = []
-            
+
             for elem in elements:
                 text = elem['text'].lower()
-                
-                # Проверяем несколько форматов толщины
-                thickness_patterns = [
-                    f'\\b{thickness}\\s*мм\\b',
-                    f'\\b{thickness}\\b',
-                    f'\\b{thickness}\\s*mm\\b',
-                    f'\\b{thickness_num}\\b' if thickness_num else None,
-                ]
-                
-                found = False
-                for pattern in thickness_patterns:
-                    if pattern and re.search(pattern, text, re.IGNORECASE):
-                        found = True
-                        break
-                
-                # Также проверяем числа в тексте
-                if not found and thickness_num:
-                    # Ищем все числа в тексте
-                    numbers = re.findall(r'\d+(?:[.,]\d+)?', text)
-                    for num_str in numbers:
-                        try:
-                            # Заменяем запятые на точки
-                            num = float(num_str.replace(',', '.'))
-                            # Проверяем совпадение с небольшой погрешностью
-                            if abs(num - thickness_num) < 0.1:
-                                found = True
-                                break
-                        except:
-                            continue
-                
+
+                found = self._text_matches_thickness(text, thickness, tolerance=0.1)
+
                 if found:
                     # Извлекаем цену из элемента
                     price = self.extract_price_from_text(text)
@@ -944,37 +1114,12 @@ class PriceParserWithSheets:
                         # Получаем значение толщины из соответствующей колонки
                         thickness_cell = cells[thickness_col_idx]
                         thickness_text = thickness_cell.get_text(strip=True)
-                        
+
                         # Проверяем, содержит ли ячейка нужную толщину
-                        thickness_found = False
-                        
-                        # Проверяем точное совпадение (например, "4" или "4мм")
-                        thickness_patterns = [
-                            f'^{thickness}\\s*мм$',
-                            f'^{thickness}\\s*mm$',
-                            f'^{thickness}$',
-                            f'\\b{thickness}\\s*мм\\b',
-                            f'\\b{thickness}\\s*mm\\b',
-                            f'\\b{thickness}\\b'
-                        ]
-                        
-                        for pattern in thickness_patterns:
-                            if re.search(pattern, thickness_text, re.IGNORECASE):
-                                thickness_found = True
-                                break
-                        
-                        # Также проверяем числовое значение
-                        if not thickness_found:
-                            numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_text)
-                            for num_str in numbers:
-                                try:
-                                    num = float(num_str.replace(',', '.'))
-                                    if abs(num - float(thickness)) < 0.01:
-                                        thickness_found = True
-                                        break
-                                except:
-                                    continue
-                        
+                        thickness_found = self._text_matches_thickness(
+                            thickness_text, thickness, mode='exact', tolerance=0.01
+                        )
+
                         if thickness_found:
                             logger.info(f"Найдена строка с толщиной {thickness}мм: '{thickness_text}'")
                             
@@ -1000,7 +1145,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка в универсальном парсере таблиц: {e}")
-            import traceback
             traceback.print_exc()
             return None
 
@@ -1067,27 +1211,11 @@ class PriceParserWithSheets:
                 return None
             
             clean_name = product_name.lower().strip()
-            
-            material_types = {
-                'поликарбонат': 'поликарбонат',
-                'polygal': 'поликарбонат',
-                'оргстекло': 'оргстекло',
-                'орг.стекло': 'оргстекло',
-                'акрил': 'акрил',
-                'пластик': 'пластик',
-                'пвх': 'пвх',
-                'пенопласт': 'пенопласт',
-                'дерево': 'дерево',
-                'металл': 'металл',
-                'алюминий': 'алюминий',
-                'сталь': 'сталь',
-                'стекло': 'стекло'
-            }
-            
-            for keyword, material in material_types.items():
+
+            for keyword, material in MATERIAL_TYPE_KEYWORDS.items():
                 if keyword in clean_name:
                     return material
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения типа материала: {e}")
@@ -1140,13 +1268,8 @@ class PriceParserWithSheets:
                         return word
             
             # Ищем известные бренды
-            known_brands = [
-                'polygal', 'plazcryl', 'акрилекс', 'моногал', 'легпром',
-                'полигаль', 'плазкрил', 'akrilux', 'monogal'
-            ]
-            
             clean_name = product_name.lower()
-            for brand in known_brands:
+            for brand in KNOWN_BRANDS:
                 if brand in clean_name:
                     return brand
             
@@ -1165,21 +1288,11 @@ class PriceParserWithSheets:
                 return None
             
             clean_name = product_name.lower().strip()
-            
-            product_types = {
-                'сотовый': 'сотовый',
-                'монолитный': 'монолитный',
-                'листовой': 'листовой',
-                'профилированный': 'профилированный',
-                'ячеистый': 'ячеистый',
-                'сот': 'сотовый',
-                'монолит': 'монолитный'
-            }
-            
-            for keyword, product_type in product_types.items():
+
+            for keyword, product_type in PRODUCT_TYPE_KEYWORDS.items():
                 if keyword in clean_name:
                     return product_type
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения типа продукта: {e}")
@@ -1199,20 +1312,8 @@ class PriceParserWithSheets:
                 thickness = parameters['thickness']
                 
                 # Ищем толщину разными способами
-                found_thickness = False
-                
-                # Паттерны для поиска толщины
-                thickness_patterns = [
-                    f'{thickness}\\s*мм',
-                    f'{thickness}\\s*mm',
-                    f'\\b{thickness}\\b'
-                ]
-                
-                for pattern in thickness_patterns:
-                    if re.search(pattern, row_text_lower):
-                        found_thickness = True
-                        break
-                
+                found_thickness = self._thickness_regex_match(row_text_lower, thickness, mode='boundary')
+
                 # Также проверяем числовое совпадение, но ИСКЛЮЧАЯ числа в ценах
                 if not found_thickness:
                     # Разделяем текст на слова и проверяем каждое слово отдельно
@@ -1241,7 +1342,7 @@ class PriceParserWithSheets:
                                 if not is_price_context:
                                     found_thickness = True
                                     break
-                        except:
+                        except Exception:
                             continue
                 
                 # Если толщина не найдена - строка НЕ подходит
@@ -1301,20 +1402,13 @@ class PriceParserWithSheets:
             logger.info(f"Ищем толщину: {thickness}")
             
             # Ищем толщину разными способами
-            thickness_patterns = [
-                f'{thickness}\\s*мм',
-                f'{thickness}\\s*mm',
-                f'\\b{thickness}\\b'
-            ]
-            
-            for pattern in thickness_patterns:
+            for pattern in self._thickness_regex_patterns(thickness, mode='boundary'):
                 match = re.search(pattern, row_text.lower())
                 if match:
                     logger.info(f"Найдена толщина по паттерну '{pattern}': {match.group()}")
-            
+
             # Ищем все числа в строке
-            numbers = re.findall(r'\d+(?:[.,]\d+)?', row_text)
-            logger.info(f"Все числа в строке: {numbers}")
+            logger.info(f"Все числа в строке: {self._numbers_in_text(row_text)}")
 
     def extract_important_keywords(self, product_name):
         """
@@ -1325,20 +1419,13 @@ class PriceParserWithSheets:
             if not product_name:
                 return []   
             
-            # Общие слова, которые не несут смысловой нагрузки
-            stop_words = {
-                'на', 'и', 'в', 'с', 'для', 'по', 'из', 'от', 'до', 
-                'мм', 'см', 'м', 'кг', 'г', 'л', 'шт', 'упак',
-                'лист', 'листа', 'листов', 'пластина', 'плита'
-            }
-            
             words = re.findall(r'[а-яa-z0-9]{2,}', product_name.lower())
-            
+
             # Фильтруем стоп-слова и короткие слова
             keywords = []
             for word in words:
-                if (word not in stop_words and 
-                    len(word) > 2 and 
+                if (word not in KEYWORD_STOP_WORDS and
+                    len(word) > 2 and
                     not word.isdigit() and
                     not (word.isdigit() and len(word) < 3)):  # Исключаем маленькие числа
                     keywords.append(word)
@@ -1414,32 +1501,26 @@ class PriceParserWithSheets:
             # Базовые проверки для всех товаров
             if price <= 0:
                 return False
-            
+
             # Если имя товара не указано, используем общие проверки
             if not product_name or product_name == 'any':
-                # Общий диапазон для неизвестных товаров
-                return 100 <= price <= 100000
-            
+                low, high = UNKNOWN_PRODUCT_PRICE_RANGE
+                return low <= price <= high
+
             product_name_lower = product_name.lower()
-            
-            # Поликарбонат POLYGAL сотовый - цена за лист
-            if 'поликарбонат' in product_name_lower and 'polygal' in product_name_lower and 'сотовый' in product_name_lower:
-                # Цена за лист поликарбоната 4мм должна быть около 7686
-                return 5000 <= price <= 20000
-            
-            # Оргстекло PLAZCRYL
-            elif 'орг.стекло' in product_name_lower and 'plazcryl' in product_name_lower:
-                return 5000 <= price <= 30000
-            
-            # Композитные панели
-            elif 'композитная панель' in product_name_lower:
-                return 3000 <= price <= 15000
-            
+
+            # Ищем первое правило, для которого встречаются ВСЕ его ключевые слова
+            for rule in PRODUCT_PRICE_RANGES:
+                if all(keyword in product_name_lower for keyword in rule['keywords']):
+                    return rule['min'] <= price <= rule['max']
+
             # Общий диапазон для других товаров
-            return 100 <= price <= 50000
+            low, high = DEFAULT_PRICE_RANGE
+            return low <= price <= high
         except Exception as e:
             logger.error(f"Ошибка проверки цены: {e}")
-            return 100 <= price <= 50000  # Безопасный диапазон
+            low, high = DEFAULT_PRICE_RANGE
+            return low <= price <= high  # Безопасный диапазон
 
     def find_product_in_alternative_structures(self, html, product_name, parameters):
         """
@@ -1509,33 +1590,7 @@ class PriceParserWithSheets:
         """
         Проверяет, содержит ли текст указанную толщину.
         """
-        if not text or not thickness:
-            return False
-        
-        text_lower = text.lower()
-        
-        # Паттерны для поиска толщины
-        thickness_patterns = [
-            f'{thickness}\\s*мм',
-            f'{thickness}\\s*mm',
-            f'\\b{thickness}\\b'
-        ]
-        
-        for pattern in thickness_patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                return True
-        
-        # Также проверяем числовое значение
-        numbers = re.findall(r'\d+(?:[.,]\d+)?', text_lower)
-        for num_str in numbers:
-            try:
-                num = float(num_str.replace(',', '.'))
-                if abs(num - float(thickness)) < 0.1:
-                    return True
-            except:
-                continue
-        
-        return False
+        return self._text_matches_thickness(text, thickness, mode='boundary', tolerance=0.1)
 
     def find_price_in_element(self, element):
         """
@@ -1601,35 +1656,12 @@ class PriceParserWithSheets:
                     
                     # Пытаемся извлечь толщину из первой ячейки
                     thickness_cell_text = cells[0].get_text(strip=True)
-                    
+
                     # Проверяем, содержит ли ячейка нашу толщину
-                    thickness_found = False
-                    thickness_patterns = [
-                        f'^{thickness}\\s*мм$',
-                        f'^{thickness}\\s*mm$',
-                        f'^{thickness}$',
-                        f'\\b{thickness}\\s*мм\\b',
-                        f'\\b{thickness}\\s*mm\\b',
-                        f'\\b{thickness}\\b'
-                    ]
-                    
-                    for pattern in thickness_patterns:
-                        if re.search(pattern, thickness_cell_text, re.IGNORECASE):
-                            thickness_found = True
-                            break
-                    
-                    # Также проверяем числовое значение
-                    if not thickness_found:
-                        numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_cell_text)
-                        for num_str in numbers:
-                            try:
-                                num = float(num_str.replace(',', '.'))
-                                if abs(num - float(thickness)) < 0.1:
-                                    thickness_found = True
-                                    break
-                            except:
-                                continue
-                    
+                    thickness_found = self._text_matches_thickness(
+                        thickness_cell_text, thickness, mode='exact', tolerance=0.1
+                    )
+
                     if thickness_found:
                         logger.info(f"Найдена строка с толщиной {thickness}мм в таблице {table_idx+1}, строка {row_idx+1}")
                         logger.info(f"Текст ячейки с толщиной: '{thickness_cell_text}'")
@@ -1672,7 +1704,7 @@ class PriceParserWithSheets:
                             try:
                                 num = float(num_str.replace(',', '.'))
                                 numbers_float.append(num)
-                            except:
+                            except Exception:
                                 continue
                         
                         # Фильтруем числа
@@ -1731,7 +1763,7 @@ class PriceParserWithSheets:
                             thickness_val = float(found_thickness.replace(',', '.'))
                             thickness_price_map[thickness_val] = price
                             logger.info(f"Найдена толщина {thickness_val}мм с ценой {price}")
-                        except:
+                        except Exception:
                             continue
             
             # Теперь ищем цену для нужной толщины
@@ -1753,7 +1785,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка в улучшенном парсере оргстекла: {e}")
-            import traceback
             traceback.print_exc()
             return None
     
@@ -1831,36 +1862,12 @@ class PriceParserWithSheets:
                 # В таблице bestly.ru структура обычно: чекбокс, цвет, толщина, размер, цена
                 # Проверяем только ячейку с индексом 2 (третья ячейка - толщина)
                 thickness_found = False
-                
+
                 if len(cells) > 2:
                     thickness_cell_text = cell_texts[2]  # Третья ячейка должна быть толщиной
-                    
-                    # Проверяем точное совпадение толщины
-                    thickness_patterns = [
-                        f'^{thickness}\\s*мм$',
-                        f'^{thickness}\\s*mm$',
-                        f'^{thickness}$',
-                        f'\\b{thickness}\\s*мм\\b',
-                        f'\\b{thickness}\\s*mm\\b',
-                        f'\\b{thickness}\\b'
-                    ]
-                    
-                    for pattern in thickness_patterns:
-                        if re.search(pattern, thickness_cell_text, re.IGNORECASE):
-                            thickness_found = True
-                            break
-                    
-                    # Также проверяем числовое значение
-                    if not thickness_found:
-                        numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_cell_text)
-                        for num_str in numbers:
-                            try:
-                                num = float(num_str.replace(',', '.'))
-                                if abs(num - float(thickness)) < 0.01:  # Точное сравнение
-                                    thickness_found = True
-                                    break
-                            except:
-                                continue
+                    thickness_found = self._text_matches_thickness(
+                        thickness_cell_text, thickness, mode='exact', tolerance=0.01
+                    )
                 
                 # Ищем цвет, если он указан
                 color_found = False if color else True  # Если цвет не указан, считаем, что он найден
@@ -1944,7 +1951,7 @@ class PriceParserWithSheets:
                             if abs(num - float(thickness)) < 0.01:
                                 score += 70
                                 break
-                    except:
+                    except Exception:
                         pass
                     
                     # Приоритет для правильного цвета
@@ -1971,7 +1978,6 @@ class PriceParserWithSheets:
                 
         except Exception as e:
             logger.error(f"Ошибка в новом парсере таблицы оргстекла: {e}")
-            import traceback
             traceback.print_exc()
             return None
         
@@ -2019,7 +2025,7 @@ class PriceParserWithSheets:
                         sibling_text = str(siblings[i]).lower()
                         if clean_product_name in sibling_text:
                             return True
-            except:
+            except Exception:
                 pass
             
             return False
@@ -2111,7 +2117,7 @@ class PriceParserWithSheets:
                             card_class = card.get_attribute('class').lower() if card.get_attribute('class') else ''
                             if any(cls in card_class for cls in ['item', 'product', 'card', 'catalog']):
                                 break
-                        except:
+                        except Exception:
                             pass
                         card = card.find_element(By.XPATH, "./..")
                     
@@ -2119,7 +2125,7 @@ class PriceParserWithSheets:
                     if price_selector:
                         try:
                             price_element = card.find_element(By.CSS_SELECTOR, price_selector)
-                        except:
+                        except Exception:
                             price_element = None
                     else:
                         price_element = None
@@ -2128,7 +2134,7 @@ class PriceParserWithSheets:
                             try:
                                 price_element = card.find_element(By.CSS_SELECTOR, sel)
                                 break
-                            except:
+                            except Exception:
                                 continue
                     
                     if price_element:
@@ -2154,7 +2160,7 @@ class PriceParserWithSheets:
                                 if price_selector:
                                     try:
                                         price_element = card.find_element(By.CSS_SELECTOR, price_selector)
-                                    except:
+                                    except Exception:
                                         price_element = None
                                 else:
                                     price_element = None
@@ -2162,16 +2168,16 @@ class PriceParserWithSheets:
                                         try:
                                             price_element = card.find_element(By.CSS_SELECTOR, sel)
                                             break
-                                        except:
+                                        except Exception:
                                             continue
                                 if price_element:
                                     price_text = price_element.text
                                     price = self.extract_price_from_text(price_text)
                                     if price:
                                         return price
-                        except:
+                        except Exception:
                             continue
-                except:
+                except Exception:
                     continue
 
             return None
@@ -2386,11 +2392,22 @@ class PriceParserWithSheets:
             tag = element.name
             return tag
             
-        except:
+        except Exception:
             return None
     
     def get_with_requests(self, url, headers=None):
-        """Получение страницы с помощью requests"""
+        """
+        Получение страницы с помощью requests.
+
+        Побочный эффект: сохраняет в self.last_fetched_url финальный URL
+        после всех редиректов (site.ru может сделать 301 со старого адреса
+        товара на новый, если его ЧПУ-слаг пересобрался) и в
+        self.last_status_code — HTTP-статус ответа. Вызывающий код может
+        использовать last_fetched_url, чтобы обновить сохраненную ссылку
+        на товар и не держать её "протухшей" вручную.
+        """
+        self.last_fetched_url = None
+        self.last_status_code = None
         try:
             if headers is None:
                 headers = {
@@ -2400,25 +2417,33 @@ class PriceParserWithSheets:
                     'Accept-Encoding': 'gzip, deflate, br',
                     'Connection': 'keep-alive',
                 }
-            
+
             response = requests.get(
-                url, 
-                headers=headers, 
+                url,
+                headers=headers,
                 timeout=60,  # Увеличиваем таймаут для Bestly
                 verify=True,
                 allow_redirects=True
             )
-            
+            self.last_status_code = response.status_code
+
             if response.status_code != 200:
                 logger.warning(f"Страница вернула статус {response.status_code}: {url}")
                 return None
-            
+
+            # Если сайт сделал редирект на другой адрес (например, ЧПУ-ссылка
+            # товара изменилась) — запоминаем финальный URL для самолечения
+            resolved_url = strip_tracking_params(response.url)
+            if resolved_url and resolved_url != url:
+                logger.info(f"Ссылка была перенаправлена: {url} -> {resolved_url}")
+            self.last_fetched_url = resolved_url
+
             # Определяем кодировку
             if response.encoding is None or response.encoding == 'ISO-8859-1':
                 response.encoding = 'utf-8'
-            
+
             return response.text
-            
+
         except requests.exceptions.Timeout:
             logger.error(f"Таймаут при запросе к {url}")
             return None
@@ -2447,7 +2472,7 @@ class PriceParserWithSheets:
                 try:
                     self.driver.delete_all_cookies()
                     logger.info("Cookies очищены для Bestly")
-                except:
+                except Exception:
                     pass
             
             # Загружаем страницу
@@ -2456,13 +2481,24 @@ class PriceParserWithSheets:
             # Настраиваем время ожидания в зависимости от сайта
             if 'bestly.ru' in url:
                 wait_time = wait_time or 20  # Увеличиваем ожидание для Bestly
-                logger.info(f"Ожидание загрузки Bestly: {wait_time} секунд...")
-                
-                # Ждем загрузки страницы
-                time.sleep(wait_time)
-                
+                logger.info(f"Ожидание загрузки Bestly: до {wait_time} секунд...")
+
+                # Вместо слепого time.sleep(wait_time) ждем появления хотя бы
+                # одного элемента, похожего на цену/таблицу — обычно это
+                # происходит быстрее верхней границы, а на медленных
+                # страницах мы всё равно ждем не дольше, чем раньше.
+                try:
+                    WebDriverWait(self.driver, wait_time).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, 'table, [class*="price"], [class*="Price"], [data-price]')
+                        )
+                    )
+                except TimeoutException:
+                    logger.warning(f"Не дождались признаков цены за {wait_time}с, продолжаем как есть")
+
                 # Прокручиваем несколько раз для загрузки динамического контента
                 scroll_attempts = 8  # Увеличиваем количество прокруток
+                found_prices_during_scroll = False
                 for i in range(scroll_attempts):
                     try:
                         # Прокручиваем страницу
@@ -2471,20 +2507,23 @@ class PriceParserWithSheets:
                         self.driver.execute_script(f"window.scrollTo(0, {current_scroll});")
                         logger.info(f"Прокрутка {i+1}/{scroll_attempts} до позиции {current_scroll}")
                         time.sleep(4)  # Увеличиваем ожидание после прокрутки
-                        
+
                         # Пробуем найти элементы с ценами
                         price_elements = self.driver.find_elements(By.CSS_SELECTOR, '[class*="price"], [class*="Price"], [data-price], .price, .Price')
                         if price_elements and i >= 3:  # Если нашли цены после 4-й прокрутки
                             logger.info(f"Найдено {len(price_elements)} элементов с ценами после прокрутки")
+                            found_prices_during_scroll = True
                             break
-                            
+
                     except Exception as e:
                         logger.warning(f"Ошибка при прокрутке: {e}")
                         continue
-                
-                # Дополнительное ожидание для динамического контента
-                time.sleep(8)
-                
+
+                # Дополнительное ожидание для динамического контента.
+                # Если цены уже найдены во время прокрутки — не ждем полные
+                # 8 секунд впустую, короткой паузы достаточно.
+                time.sleep(2 if found_prices_during_scroll else 8)
+
                 # Пробуем кликнуть на кнопки "Показать еще" или аналогичные
                 try:
                     show_more_buttons = self.driver.find_elements(By.XPATH, "//button[contains(text(), 'Показать') or contains(text(), 'Еще') or contains(text(), 'Загрузить') or contains(text(), 'Показать еще')]")
@@ -2493,15 +2532,20 @@ class PriceParserWithSheets:
                             button.click()
                             time.sleep(5)
                             logger.info("Кликнут на кнопку 'Показать еще'")
-                        except:
+                        except Exception:
                             pass
-                except:
+                except Exception:
                     pass
                     
             else:
                 # Для других сайтов используем стандартное ожидание
                 wait_time = wait_time or 10
-                time.sleep(wait_time)
+                try:
+                    WebDriverWait(self.driver, wait_time).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                except TimeoutException:
+                    logger.warning(f"Страница не сообщила о готовности за {wait_time}с, продолжаем как есть")
                 self.driver.execute_script("window.scrollTo(0, 500);")
                 time.sleep(2)
             
@@ -2526,7 +2570,7 @@ class PriceParserWithSheets:
                     return page_source
                 else:
                     return None
-            except:
+            except Exception:
                 return None
         except Exception as e:
             logger.error(f"Ошибка Selenium при загрузке {url}: {str(e)[:200]}")
@@ -2555,7 +2599,7 @@ class PriceParserWithSheets:
             
             row = self.df.iloc[idx]
             name = safe_str(row.get('Название', f'Товар {idx+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             
             if not url:
                 print("URL не указан для этого товара")
@@ -2701,7 +2745,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
             input("\nНажмите Enter для возврата в меню...")
 
@@ -2719,7 +2762,7 @@ class PriceParserWithSheets:
             for idx in range(len(self.df)):
                 row = self.df.iloc[idx]
                 name = safe_str(row.get('Название', f'Товар {idx+1}'))
-                url = safe_str(row.get('URL', '')).strip()
+                url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
                 
                 if 'bestly.ru' in url:
                     bestly_products.append((idx, name, url))
@@ -2792,7 +2835,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
     
     def test_selector_for_product(self):
@@ -2816,7 +2858,7 @@ class PriceParserWithSheets:
             
             row = self.df.iloc[idx]
             name = safe_str(row.get('Название', f'Товар {idx+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             selector = safe_str(row.get('Селектор', '')).strip()
             
             if not url:
@@ -2874,7 +2916,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
             input("\nНажмите Enter для возврата в меню...")
     
@@ -2968,7 +3009,7 @@ class PriceParserWithSheets:
         try:
             # Получаем данные из строки
             name = safe_str(row.get('Название', f'Товар {index+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             selector = safe_str(row.get('Селектор', '')).strip()
             characteristic = safe_str(row.get('Характеристика', '')).strip()
             
@@ -3027,8 +3068,21 @@ class PriceParserWithSheets:
             if method == 'requests' or not html:
                 headers = self.site_configs.get(domain, {}).get('headers', {})
                 html = self.get_with_requests(url, headers)
-            
+
+                # Сайт мог сделать редирект со старой ссылки на новую (например,
+                # у товара пересобрался ЧПУ-адрес) — "самолечим" ссылку прямо
+                # здесь, чтобы result['url'] попал в Excel уже актуальным и не
+                # приходилось вручную обновлять её при каждом изменении.
+                if html and self.last_fetched_url and self.last_fetched_url != url:
+                    logger.info(f"Ссылка товара изменилась (редирект сайта): {url} -> {self.last_fetched_url}")
+                    url = self.last_fetched_url
+                    domain = self.extract_domain(url)
+
             if not html:
+                if self.last_status_code == 404:
+                    status = 'Ссылка больше не работает (404) — нужно найти новый адрес товара на сайте'
+                else:
+                    status = 'Не удалось загрузить страницу'
                 return {
                     'index': index,
                     'name': name,
@@ -3037,7 +3091,7 @@ class PriceParserWithSheets:
                     'characteristic': characteristic,
                     'selector_used': selector,
                     'best_found_selector': '',
-                    'status': 'Не удалось загрузить страницу',
+                    'status': status,
                     'rounding_mode': self.rounding_mode,
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
@@ -3101,153 +3155,119 @@ class PriceParserWithSheets:
             # Сначала пробуем использовать указанный селектор с фильтрацией по названию
             if selector and selector.strip():
                 logger.info(f"Пробуем использовать селектор с названием: {selector}")
-                    
+
                 # Используем функцию с фильтрацией по названию
                 price = self.find_price_with_selector_and_name(html, selector, name)
-                
+
                 if price:
-                        # Ищем название товара на странице
-                        found_product_name = self.extract_product_name_from_page(html)
-                        if found_product_name:
-                            best_characteristic = found_product_name
-                        
-                        best_price = price
-                        best_selector = selector
-                        best_found_selector = selector
-                        best_method = 'specified_selector_with_name'
-                        status = f"Успешно (указанный селектор с названием: {selector})"
-                        logger.info(f"✓ Цена найдена по указанному селектору с названием: {best_price} руб.")
+                    # Ищем название товара на странице
+                    found_product_name = self.extract_product_name_from_page(html)
+                    if found_product_name:
+                        best_characteristic = found_product_name
+
+                    best_price = price
+                    best_selector = selector
+                    best_found_selector = selector
+                    best_method = 'specified_selector_with_name'
+                    status = f"Успешно (указанный селектор с названием: {selector})"
+                    logger.info(f"✓ Цена найдена по указанному селектору с названием: {best_price} руб.")
                 else:
-                        logger.info("✗ По указанному селектору с названием цена не найдена")
-                        
-                        # Если селектор не сработал с названием, ищем другие варианты
-                        if 'bestly.ru' in domain:
-                            logger.info("Для Bestly ищем альтернативные селекторы...")
-                            # Используем специальные селекторы для Bestly
-                            bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-                            for sel in bestly_selectors:
-                                price = self.find_price_with_selector_and_name(html, sel, name)
-                                if price:
-                                    found_product_name = self.extract_product_name_from_page(html)
-                                    if found_product_name:
-                                        best_characteristic = found_product_name
-                                    
-                                    best_price = price
-                                    best_found_selector = sel
-                                    best_method = 'bestly_specific_with_name'
-                                    status = f"Успешно (специальный селектор Bestly: {sel})"
-                                    logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
-                                    break
-                        
-                        # Если все еще не найдено, ищем любыми способами
-                        if not best_price:
-                            logger.info("Ищем цену любыми способами с названием...")
-                            price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
-                            
-                            if price_results:
-                                # Берем первую найденную цену (уже отсортированы по наличию названия)
-                                best_result = price_results[0]
-                                best_price = best_result['price']
-                                best_found_selector = best_result.get('selector', '')
-                                best_method = best_result['method']
-                                status = f"Успешно ({best_method})"
-                                
-                                # Обновляем характеристику, если нашли название
-                                if found_name:
-                                    best_characteristic = found_name
-                                elif best_result.get('product_name'):
-                                    best_characteristic = best_result.get('product_name')
-                                
-                                logger.info(f"Найдено {len(price_results)} вариантов цен:")
-                                for i, result in enumerate(price_results, 1):
-                                    name_flag = " [с названием]" if result.get('has_product_name', False) else ""
-                                    logger.info(f"  {i}. {result['price']} руб. (метод: {result['method']}, селектор: {result.get('selector', 'не указан')}){name_flag}")
-                            else:
-                                best_price = None
-                                status = f"Цена не найдена (селектор: {selector})"
-                        else:
-                            # Если селектора нет, ищем любыми способами с названием
-                            logger.info("Селектор не указан, ищем любыми способами с названием...")
-                    
-                        # Для Bestly сначала пробуем специальные селекторы
-                        if 'bestly.ru' in domain:
-                            logger.info("Для Bestly ищем специальные селекторы...")
-                            bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-                            for sel in bestly_selectors:
-                                price = self.find_price_with_selector_and_name(html, sel, name)
-                                if price:
-                                    found_product_name = self.extract_product_name_from_page(html)
-                                    if found_product_name:
-                                        best_characteristic = found_product_name
-                                
-                                    best_price = price
-                                    best_selector = sel
-                                    best_found_selector = sel
-                                    best_method = 'bestly_specific_with_name'
-                                    status = f"Успешно (специальный селектор Bestly: {sel})"
-                                    logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
-                                    break
-                                
-                        # Если все еще не найдено, ищем любыми способами
-                        if not best_price:
-                            price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
-                            
-                            if price_results:
-                                # Берем первую найденную цену (уже отсортированы по наличию названия)
-                                best_result = price_results[0]
-                                best_price = best_result['price']
-                                best_selector = best_result.get('selector', '')  # Можем сохранить найденный селектор
-                                best_found_selector = best_result.get('selector', '')
-                                best_method = best_result['method']
-                                status = f"Успешно ({best_method})"
-                            
-                            # Обновляем характеристику, если нашли название
-                            if found_name:
-                                best_characteristic = found_name
-                            elif best_result.get('product_name'):
-                                best_characteristic = best_result.get('product_name')
-                            
-                            logger.info(f"Найдено {len(price_results)} вариантов цен:")
-                            for i, result in enumerate(price_results, 1):
-                                name_flag = " [с названием]" if result.get('has_product_name', False) else ""
-                                logger.info(f"  {i}. {result['price']} руб. (метод: {result['method']}, селектор: {result.get('selector', 'не указан')}){name_flag}")
-                        else:
-                            best_price = None
-                            status = 'Цена не найдена'
-                
-                # Fallback: для сайтов, которые используют Selenium и имеют флаг use_selenium_context_search
-                if domain in self.site_configs and self.site_configs[domain].get('use_selenium_context_search', False):
-                    if not best_price and self.driver:
-                        logger.info(f"Пробуем Selenium контекстный поиск для {name}")
-                        selenium_price = self.find_price_with_selenium_by_name(name, selector)
-                        if selenium_price:
-                            best_price = selenium_price
-                            best_method = 'selenium_context'
-                            status = "Успешно (Selenium контекстный поиск)"
-                            logger.info(f"Найдена цена через Selenium контекстный поиск: {best_price}")
-                
-                # Формируем результат
-                result = {
-                    'index': index,
-                    'name': name,
-                    'url': url,
-                    'price': best_price,
-                    'characteristic': best_characteristic,  # Сохраняем найденную характеристику
-                    'selector_used': selector,  # Сохраняем исходный селектор
-                    'best_found_selector': best_found_selector,  # Найденный селектор
-                    'status': status,
-                    'rounding_mode': self.rounding_mode,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-        
+                    logger.info("✗ По указанному селектору с названием цена не найдена")
+            else:
+                logger.info("Селектор не указан, ищем любыми способами с названием...")
+
+            # Если цена ещё не найдена (указанный селектор не сработал или не
+            # был задан вовсе) — пробуем остальные способы РОВНО ОДИН РАЗ.
+            #
+            # Раньше этот блок был по ошибке продублирован и вложен так, что:
+            #  1) если селектор не был указан вообще, этот код не выполнялся
+            #     ни разу, и переменная result ниже оставалась неприсвоенной,
+            #     из-за чего парсинг товара падал с UnboundLocalError на
+            #     КАЖДОМ товаре без селектора (а он не указан почти всегда,
+            #     пока пользователь не выберет его вручную через меню);
+            #  2) если селектор был указан, но не сработал, а альтернативные
+            #     селекторы Bestly находили цену — код всё равно проваливался
+            #     в скопированный ниже блок и, не находя ничего через
+            #     find_price_and_name_on_page(selector=None) во второй раз,
+            #     обнулял уже найденную best_price обратно в None.
+            # Оба случая тихо превращали найденную цену в "Цена не найдена".
+            if not best_price:
+                if 'bestly.ru' in domain:
+                    logger.info("Для Bestly ищем специальные селекторы...")
+                    bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
+                    for sel in bestly_selectors:
+                        price = self.find_price_with_selector_and_name(html, sel, name)
+                        if price:
+                            found_product_name = self.extract_product_name_from_page(html)
+                            if found_product_name:
+                                best_characteristic = found_product_name
+
+                            best_price = price
+                            best_selector = sel
+                            best_found_selector = sel
+                            best_method = 'bestly_specific_with_name'
+                            status = f"Успешно (специальный селектор Bestly: {sel})"
+                            logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
+                            break
+
+                if not best_price:
+                    logger.info("Ищем цену любыми способами с названием...")
+                    price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
+
+                    if price_results:
+                        # Берем первую найденную цену (уже отсортированы по наличию названия)
+                        best_result = price_results[0]
+                        best_price = best_result['price']
+                        best_selector = best_result.get('selector', '')
+                        best_found_selector = best_result.get('selector', '')
+                        best_method = best_result['method']
+                        status = f"Успешно ({best_method})"
+
+                        # Обновляем характеристику, если нашли название
+                        if found_name:
+                            best_characteristic = found_name
+                        elif best_result.get('product_name'):
+                            best_characteristic = best_result.get('product_name')
+
+                        logger.info(f"Найдено {len(price_results)} вариантов цен:")
+                        for i, price_option in enumerate(price_results, 1):
+                            name_flag = " [с названием]" if price_option.get('has_product_name', False) else ""
+                            logger.info(f"  {i}. {price_option['price']} руб. (метод: {price_option['method']}, селектор: {price_option.get('selector', 'не указан')}){name_flag}")
+                    else:
+                        status = f"Цена не найдена (селектор: {selector})" if selector else 'Цена не найдена'
+
+            # Fallback: для сайтов, которые используют Selenium и имеют флаг use_selenium_context_search
+            if domain in self.site_configs and self.site_configs[domain].get('use_selenium_context_search', False):
+                if not best_price and self.driver:
+                    logger.info(f"Пробуем Selenium контекстный поиск для {name}")
+                    selenium_price = self.find_price_with_selenium_by_name(name, selector)
+                    if selenium_price:
+                        best_price = selenium_price
+                        best_method = 'selenium_context'
+                        status = "Успешно (Selenium контекстный поиск)"
+                        logger.info(f"Найдена цена через Selenium контекстный поиск: {best_price}")
+
+            # Формируем результат
+            result = {
+                'index': index,
+                'name': name,
+                'url': url,
+                'price': best_price,
+                'characteristic': best_characteristic,  # Сохраняем найденную характеристику
+                'selector_used': selector,  # Сохраняем исходный селектор
+                'best_found_selector': best_found_selector,  # Найденный селектор
+                'status': status,
+                'rounding_mode': self.rounding_mode,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+
             # Выводим в консоль
             self.print_result(result)
-            
+
             return result
             
         except Exception as e:
             logger.error(f"Ошибка при парсинге товара {index+1}: {e}")
-            import traceback
             traceback.print_exc()
             
             # В случае ошибки закрываем драйвер, если он есть
@@ -3337,7 +3357,7 @@ class PriceParserWithSheets:
                     break
                 
                 row = self.df.iloc[idx]
-                url = safe_str(row.get('URL', '')).strip()
+                url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
                 
                 # Определяем тип сайта
                 domain = self.extract_domain(url)
@@ -3386,7 +3406,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка при парсинге всех товаров: {e}")
-            import traceback
             traceback.print_exc()
             return False
         finally:
@@ -3448,7 +3467,20 @@ class PriceParserWithSheets:
                     # Обновляем селектор только если он был пустой
                     if not current_selector and result.get('best_found_selector'):
                         ws.cell(row=row_idx, column=col_indices['Селектор']).value = result['best_found_selector']
-            
+
+                # Самолечение ссылки: если сайт сделал редирект на новый адрес
+                # товара (см. get_with_requests/parse_single_product), или из
+                # ссылки убрали трекинг-параметры (ysclid и т.п.) — записываем
+                # актуальный URL обратно в Excel, чтобы не редактировать его
+                # руками при каждом изменении. Пустой result['url'] (например,
+                # статус "URL не указан") сюда не попадает — ячейку не трогаем.
+                if 'URL' in col_indices and result.get('url'):
+                    current_url = ws.cell(row=row_idx, column=col_indices['URL']).value
+                    new_url = result['url']
+                    if current_url != new_url:
+                        ws.cell(row=row_idx, column=col_indices['URL']).value = new_url
+                        logger.info(f"Обновлена ссылка в Excel (строка {row_idx}): {current_url} -> {new_url}")
+
             # Сохраняем файл
             wb.save(self.excel_file)
             
@@ -3462,7 +3494,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка сохранения результатов: {e}")
-            import traceback
             traceback.print_exc()
             return False
     
@@ -3608,7 +3639,7 @@ class PriceParserWithSheets:
                         cell_length = len(str(cell.value)) if cell.value else 0
                         if cell_length > max_length:
                             max_length = cell_length
-                    except:
+                    except Exception:
                         pass
                 
                 # Для столбца Цена устанавливаем фиксированную ширину
@@ -3631,7 +3662,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка форматирования: {e}")
-            import traceback
             traceback.print_exc()
     
     def generate_report(self):
@@ -3830,7 +3860,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
 
 
