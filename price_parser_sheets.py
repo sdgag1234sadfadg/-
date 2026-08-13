@@ -11,6 +11,7 @@ import math
 import json
 import hashlib
 import traceback
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -124,6 +125,39 @@ DEFAULT_PRICE_RANGE = (100, 50000)
 # Диапазон для случаев, когда название товара вообще не передано
 UNKNOWN_PRODUCT_PRICE_RANGE = (100, 100000)
 
+# Параметры трекинга рекламы/поисковиков, которые иногда попадают в ссылку
+# при копировании её из результатов поиска или рекламных кампаний
+# (например, https://site.ru/product/?ysclid=... после перехода из Яндекса).
+# Они не относятся к самому товару и их стоит убирать перед сохранением
+# и запросом ссылки — сайт отдаёт ту же страницу и без них.
+TRACKING_QUERY_PARAMS = {
+    'ysclid', 'yclid', 'gclid', 'fbclid', 'msclkid', '_openstat',
+    'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+}
+
+
+def strip_tracking_params(url):
+    """
+    Убирает известные рекламные/поисковые трекинг-параметры (ysclid, utm_*
+    и т.п.) из URL, сохраняя остальные query-параметры как есть — некоторые
+    сайты используют их для выбора конкретного товара/варианта, и их
+    удалять нельзя.
+    """
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        if not parts.query:
+            return url
+        filtered = [
+            (key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key not in TRACKING_QUERY_PARAMS
+        ]
+        new_query = urlencode(filtered)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    except Exception:
+        return url
+
 
 def safe_str(value, default=''):
     """
@@ -155,6 +189,10 @@ class PriceParserWithSheets:
         self.results = []
         self.rounding_mode = 'ceil'  # Режим округления по умолчанию
         self.user_selections = {}  # Словарь для хранения выборов пользователя
+        # Финальный URL и статус последнего запроса через get_with_requests
+        # (см. этот метод — используется для самолечения "протухших" ссылок)
+        self.last_fetched_url = None
+        self.last_status_code = None
         
         # Загружаем сохраненные выборы пользователя при инициализации
         self.load_user_selections()
@@ -2358,7 +2396,18 @@ class PriceParserWithSheets:
             return None
     
     def get_with_requests(self, url, headers=None):
-        """Получение страницы с помощью requests"""
+        """
+        Получение страницы с помощью requests.
+
+        Побочный эффект: сохраняет в self.last_fetched_url финальный URL
+        после всех редиректов (site.ru может сделать 301 со старого адреса
+        товара на новый, если его ЧПУ-слаг пересобрался) и в
+        self.last_status_code — HTTP-статус ответа. Вызывающий код может
+        использовать last_fetched_url, чтобы обновить сохраненную ссылку
+        на товар и не держать её "протухшей" вручную.
+        """
+        self.last_fetched_url = None
+        self.last_status_code = None
         try:
             if headers is None:
                 headers = {
@@ -2368,25 +2417,33 @@ class PriceParserWithSheets:
                     'Accept-Encoding': 'gzip, deflate, br',
                     'Connection': 'keep-alive',
                 }
-            
+
             response = requests.get(
-                url, 
-                headers=headers, 
+                url,
+                headers=headers,
                 timeout=60,  # Увеличиваем таймаут для Bestly
                 verify=True,
                 allow_redirects=True
             )
-            
+            self.last_status_code = response.status_code
+
             if response.status_code != 200:
                 logger.warning(f"Страница вернула статус {response.status_code}: {url}")
                 return None
-            
+
+            # Если сайт сделал редирект на другой адрес (например, ЧПУ-ссылка
+            # товара изменилась) — запоминаем финальный URL для самолечения
+            resolved_url = strip_tracking_params(response.url)
+            if resolved_url and resolved_url != url:
+                logger.info(f"Ссылка была перенаправлена: {url} -> {resolved_url}")
+            self.last_fetched_url = resolved_url
+
             # Определяем кодировку
             if response.encoding is None or response.encoding == 'ISO-8859-1':
                 response.encoding = 'utf-8'
-            
+
             return response.text
-            
+
         except requests.exceptions.Timeout:
             logger.error(f"Таймаут при запросе к {url}")
             return None
@@ -2542,7 +2599,7 @@ class PriceParserWithSheets:
             
             row = self.df.iloc[idx]
             name = safe_str(row.get('Название', f'Товар {idx+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             
             if not url:
                 print("URL не указан для этого товара")
@@ -2705,7 +2762,7 @@ class PriceParserWithSheets:
             for idx in range(len(self.df)):
                 row = self.df.iloc[idx]
                 name = safe_str(row.get('Название', f'Товар {idx+1}'))
-                url = safe_str(row.get('URL', '')).strip()
+                url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
                 
                 if 'bestly.ru' in url:
                     bestly_products.append((idx, name, url))
@@ -2801,7 +2858,7 @@ class PriceParserWithSheets:
             
             row = self.df.iloc[idx]
             name = safe_str(row.get('Название', f'Товар {idx+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             selector = safe_str(row.get('Селектор', '')).strip()
             
             if not url:
@@ -2952,7 +3009,7 @@ class PriceParserWithSheets:
         try:
             # Получаем данные из строки
             name = safe_str(row.get('Название', f'Товар {index+1}'))
-            url = safe_str(row.get('URL', '')).strip()
+            url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
             selector = safe_str(row.get('Селектор', '')).strip()
             characteristic = safe_str(row.get('Характеристика', '')).strip()
             
@@ -3011,8 +3068,21 @@ class PriceParserWithSheets:
             if method == 'requests' or not html:
                 headers = self.site_configs.get(domain, {}).get('headers', {})
                 html = self.get_with_requests(url, headers)
-            
+
+                # Сайт мог сделать редирект со старой ссылки на новую (например,
+                # у товара пересобрался ЧПУ-адрес) — "самолечим" ссылку прямо
+                # здесь, чтобы result['url'] попал в Excel уже актуальным и не
+                # приходилось вручную обновлять её при каждом изменении.
+                if html and self.last_fetched_url and self.last_fetched_url != url:
+                    logger.info(f"Ссылка товара изменилась (редирект сайта): {url} -> {self.last_fetched_url}")
+                    url = self.last_fetched_url
+                    domain = self.extract_domain(url)
+
             if not html:
+                if self.last_status_code == 404:
+                    status = 'Ссылка больше не работает (404) — нужно найти новый адрес товара на сайте'
+                else:
+                    status = 'Не удалось загрузить страницу'
                 return {
                     'index': index,
                     'name': name,
@@ -3021,7 +3091,7 @@ class PriceParserWithSheets:
                     'characteristic': characteristic,
                     'selector_used': selector,
                     'best_found_selector': '',
-                    'status': 'Не удалось загрузить страницу',
+                    'status': status,
                     'rounding_mode': self.rounding_mode,
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
@@ -3085,148 +3155,115 @@ class PriceParserWithSheets:
             # Сначала пробуем использовать указанный селектор с фильтрацией по названию
             if selector and selector.strip():
                 logger.info(f"Пробуем использовать селектор с названием: {selector}")
-                    
+
                 # Используем функцию с фильтрацией по названию
                 price = self.find_price_with_selector_and_name(html, selector, name)
-                
+
                 if price:
-                        # Ищем название товара на странице
-                        found_product_name = self.extract_product_name_from_page(html)
-                        if found_product_name:
-                            best_characteristic = found_product_name
-                        
-                        best_price = price
-                        best_selector = selector
-                        best_found_selector = selector
-                        best_method = 'specified_selector_with_name'
-                        status = f"Успешно (указанный селектор с названием: {selector})"
-                        logger.info(f"✓ Цена найдена по указанному селектору с названием: {best_price} руб.")
+                    # Ищем название товара на странице
+                    found_product_name = self.extract_product_name_from_page(html)
+                    if found_product_name:
+                        best_characteristic = found_product_name
+
+                    best_price = price
+                    best_selector = selector
+                    best_found_selector = selector
+                    best_method = 'specified_selector_with_name'
+                    status = f"Успешно (указанный селектор с названием: {selector})"
+                    logger.info(f"✓ Цена найдена по указанному селектору с названием: {best_price} руб.")
                 else:
-                        logger.info("✗ По указанному селектору с названием цена не найдена")
-                        
-                        # Если селектор не сработал с названием, ищем другие варианты
-                        if 'bestly.ru' in domain:
-                            logger.info("Для Bestly ищем альтернативные селекторы...")
-                            # Используем специальные селекторы для Bestly
-                            bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-                            for sel in bestly_selectors:
-                                price = self.find_price_with_selector_and_name(html, sel, name)
-                                if price:
-                                    found_product_name = self.extract_product_name_from_page(html)
-                                    if found_product_name:
-                                        best_characteristic = found_product_name
-                                    
-                                    best_price = price
-                                    best_found_selector = sel
-                                    best_method = 'bestly_specific_with_name'
-                                    status = f"Успешно (специальный селектор Bestly: {sel})"
-                                    logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
-                                    break
-                        
-                        # Если все еще не найдено, ищем любыми способами
-                        if not best_price:
-                            logger.info("Ищем цену любыми способами с названием...")
-                            price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
-                            
-                            if price_results:
-                                # Берем первую найденную цену (уже отсортированы по наличию названия)
-                                best_result = price_results[0]
-                                best_price = best_result['price']
-                                best_found_selector = best_result.get('selector', '')
-                                best_method = best_result['method']
-                                status = f"Успешно ({best_method})"
-                                
-                                # Обновляем характеристику, если нашли название
-                                if found_name:
-                                    best_characteristic = found_name
-                                elif best_result.get('product_name'):
-                                    best_characteristic = best_result.get('product_name')
-                                
-                                logger.info(f"Найдено {len(price_results)} вариантов цен:")
-                                for i, result in enumerate(price_results, 1):
-                                    name_flag = " [с названием]" if result.get('has_product_name', False) else ""
-                                    logger.info(f"  {i}. {result['price']} руб. (метод: {result['method']}, селектор: {result.get('selector', 'не указан')}){name_flag}")
-                            else:
-                                best_price = None
-                                status = f"Цена не найдена (селектор: {selector})"
-                        else:
-                            # Если селектора нет, ищем любыми способами с названием
-                            logger.info("Селектор не указан, ищем любыми способами с названием...")
-                    
-                        # Для Bestly сначала пробуем специальные селекторы
-                        if 'bestly.ru' in domain:
-                            logger.info("Для Bestly ищем специальные селекторы...")
-                            bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-                            for sel in bestly_selectors:
-                                price = self.find_price_with_selector_and_name(html, sel, name)
-                                if price:
-                                    found_product_name = self.extract_product_name_from_page(html)
-                                    if found_product_name:
-                                        best_characteristic = found_product_name
-                                
-                                    best_price = price
-                                    best_selector = sel
-                                    best_found_selector = sel
-                                    best_method = 'bestly_specific_with_name'
-                                    status = f"Успешно (специальный селектор Bestly: {sel})"
-                                    logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
-                                    break
-                                
-                        # Если все еще не найдено, ищем любыми способами
-                        if not best_price:
-                            price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
-                            
-                            if price_results:
-                                # Берем первую найденную цену (уже отсортированы по наличию названия)
-                                best_result = price_results[0]
-                                best_price = best_result['price']
-                                best_selector = best_result.get('selector', '')  # Можем сохранить найденный селектор
-                                best_found_selector = best_result.get('selector', '')
-                                best_method = best_result['method']
-                                status = f"Успешно ({best_method})"
-                            
-                            # Обновляем характеристику, если нашли название
-                            if found_name:
-                                best_characteristic = found_name
-                            elif best_result.get('product_name'):
-                                best_characteristic = best_result.get('product_name')
-                            
-                            logger.info(f"Найдено {len(price_results)} вариантов цен:")
-                            for i, result in enumerate(price_results, 1):
-                                name_flag = " [с названием]" if result.get('has_product_name', False) else ""
-                                logger.info(f"  {i}. {result['price']} руб. (метод: {result['method']}, селектор: {result.get('selector', 'не указан')}){name_flag}")
-                        else:
-                            best_price = None
-                            status = 'Цена не найдена'
-                
-                # Fallback: для сайтов, которые используют Selenium и имеют флаг use_selenium_context_search
-                if domain in self.site_configs and self.site_configs[domain].get('use_selenium_context_search', False):
-                    if not best_price and self.driver:
-                        logger.info(f"Пробуем Selenium контекстный поиск для {name}")
-                        selenium_price = self.find_price_with_selenium_by_name(name, selector)
-                        if selenium_price:
-                            best_price = selenium_price
-                            best_method = 'selenium_context'
-                            status = "Успешно (Selenium контекстный поиск)"
-                            logger.info(f"Найдена цена через Selenium контекстный поиск: {best_price}")
-                
-                # Формируем результат
-                result = {
-                    'index': index,
-                    'name': name,
-                    'url': url,
-                    'price': best_price,
-                    'characteristic': best_characteristic,  # Сохраняем найденную характеристику
-                    'selector_used': selector,  # Сохраняем исходный селектор
-                    'best_found_selector': best_found_selector,  # Найденный селектор
-                    'status': status,
-                    'rounding_mode': self.rounding_mode,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-        
+                    logger.info("✗ По указанному селектору с названием цена не найдена")
+            else:
+                logger.info("Селектор не указан, ищем любыми способами с названием...")
+
+            # Если цена ещё не найдена (указанный селектор не сработал или не
+            # был задан вовсе) — пробуем остальные способы РОВНО ОДИН РАЗ.
+            #
+            # Раньше этот блок был по ошибке продублирован и вложен так, что:
+            #  1) если селектор не был указан вообще, этот код не выполнялся
+            #     ни разу, и переменная result ниже оставалась неприсвоенной,
+            #     из-за чего парсинг товара падал с UnboundLocalError на
+            #     КАЖДОМ товаре без селектора (а он не указан почти всегда,
+            #     пока пользователь не выберет его вручную через меню);
+            #  2) если селектор был указан, но не сработал, а альтернативные
+            #     селекторы Bestly находили цену — код всё равно проваливался
+            #     в скопированный ниже блок и, не находя ничего через
+            #     find_price_and_name_on_page(selector=None) во второй раз,
+            #     обнулял уже найденную best_price обратно в None.
+            # Оба случая тихо превращали найденную цену в "Цена не найдена".
+            if not best_price:
+                if 'bestly.ru' in domain:
+                    logger.info("Для Bestly ищем специальные селекторы...")
+                    bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
+                    for sel in bestly_selectors:
+                        price = self.find_price_with_selector_and_name(html, sel, name)
+                        if price:
+                            found_product_name = self.extract_product_name_from_page(html)
+                            if found_product_name:
+                                best_characteristic = found_product_name
+
+                            best_price = price
+                            best_selector = sel
+                            best_found_selector = sel
+                            best_method = 'bestly_specific_with_name'
+                            status = f"Успешно (специальный селектор Bestly: {sel})"
+                            logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
+                            break
+
+                if not best_price:
+                    logger.info("Ищем цену любыми способами с названием...")
+                    price_results, found_name = self.find_price_and_name_on_page(html, url, selector=None, product_name=name)
+
+                    if price_results:
+                        # Берем первую найденную цену (уже отсортированы по наличию названия)
+                        best_result = price_results[0]
+                        best_price = best_result['price']
+                        best_selector = best_result.get('selector', '')
+                        best_found_selector = best_result.get('selector', '')
+                        best_method = best_result['method']
+                        status = f"Успешно ({best_method})"
+
+                        # Обновляем характеристику, если нашли название
+                        if found_name:
+                            best_characteristic = found_name
+                        elif best_result.get('product_name'):
+                            best_characteristic = best_result.get('product_name')
+
+                        logger.info(f"Найдено {len(price_results)} вариантов цен:")
+                        for i, price_option in enumerate(price_results, 1):
+                            name_flag = " [с названием]" if price_option.get('has_product_name', False) else ""
+                            logger.info(f"  {i}. {price_option['price']} руб. (метод: {price_option['method']}, селектор: {price_option.get('selector', 'не указан')}){name_flag}")
+                    else:
+                        status = f"Цена не найдена (селектор: {selector})" if selector else 'Цена не найдена'
+
+            # Fallback: для сайтов, которые используют Selenium и имеют флаг use_selenium_context_search
+            if domain in self.site_configs and self.site_configs[domain].get('use_selenium_context_search', False):
+                if not best_price and self.driver:
+                    logger.info(f"Пробуем Selenium контекстный поиск для {name}")
+                    selenium_price = self.find_price_with_selenium_by_name(name, selector)
+                    if selenium_price:
+                        best_price = selenium_price
+                        best_method = 'selenium_context'
+                        status = "Успешно (Selenium контекстный поиск)"
+                        logger.info(f"Найдена цена через Selenium контекстный поиск: {best_price}")
+
+            # Формируем результат
+            result = {
+                'index': index,
+                'name': name,
+                'url': url,
+                'price': best_price,
+                'characteristic': best_characteristic,  # Сохраняем найденную характеристику
+                'selector_used': selector,  # Сохраняем исходный селектор
+                'best_found_selector': best_found_selector,  # Найденный селектор
+                'status': status,
+                'rounding_mode': self.rounding_mode,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+
             # Выводим в консоль
             self.print_result(result)
-            
+
             return result
             
         except Exception as e:
@@ -3320,7 +3357,7 @@ class PriceParserWithSheets:
                     break
                 
                 row = self.df.iloc[idx]
-                url = safe_str(row.get('URL', '')).strip()
+                url = strip_tracking_params(safe_str(row.get('URL', '')).strip())
                 
                 # Определяем тип сайта
                 domain = self.extract_domain(url)
@@ -3430,7 +3467,20 @@ class PriceParserWithSheets:
                     # Обновляем селектор только если он был пустой
                     if not current_selector and result.get('best_found_selector'):
                         ws.cell(row=row_idx, column=col_indices['Селектор']).value = result['best_found_selector']
-            
+
+                # Самолечение ссылки: если сайт сделал редирект на новый адрес
+                # товара (см. get_with_requests/parse_single_product), или из
+                # ссылки убрали трекинг-параметры (ysclid и т.п.) — записываем
+                # актуальный URL обратно в Excel, чтобы не редактировать его
+                # руками при каждом изменении. Пустой result['url'] (например,
+                # статус "URL не указан") сюда не попадает — ячейку не трогаем.
+                if 'URL' in col_indices and result.get('url'):
+                    current_url = ws.cell(row=row_idx, column=col_indices['URL']).value
+                    new_url = result['url']
+                    if current_url != new_url:
+                        ws.cell(row=row_idx, column=col_indices['URL']).value = new_url
+                        logger.info(f"Обновлена ссылка в Excel (строка {row_idx}): {current_url} -> {new_url}")
+
             # Сохраняем файл
             wb.save(self.excel_file)
             
