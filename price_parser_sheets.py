@@ -135,6 +135,14 @@ TRACKING_QUERY_PARAMS = {
     'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
 }
 
+# Фразы в <title>/<h1>, по которым распознаём "мягкий" 404 — страницу вида
+# "товар не найден", отданную с HTTP-статусом 200 (см. looks_like_error_page)
+ERROR_PAGE_MARKERS = (
+    'страница не найдена', 'страницы не существует', 'страница не существует',
+    'товар не найден', 'товар не существует', 'page not found', 'not found',
+    'ошибка 404', '404 not found',
+)
+
 
 def strip_tracking_params(url):
     """
@@ -660,7 +668,36 @@ class PriceParserWithSheets:
             return ''
         except Exception:
             return ''
-    
+
+    def looks_like_error_page(self, html):
+        """
+        Определяет "мягкий" 404 — когда сайт вместо HTTP-статуса 404
+        отдаёт страницу-заглушку "товар не найден" с кодом 200 (типичная
+        конфигурация SPA/CMS). get_with_requests() в этом случае не может
+        распознать проблему по статус-коду, а без этой проверки текст
+        заглушки уходил в поиск цены (например, число "404" из заголовка
+        "Страница не найдена (404 Not Found)" принималось за цену).
+
+        Проверяет только <title> и первый <h1> — не весь текст страницы,
+        чтобы не срабатывать на обычные товары, у которых "404" может
+        случайно встретиться в артикуле где-то в теле страницы.
+        """
+        if not html:
+            return False
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            texts = []
+            title = soup.find('title')
+            if title:
+                texts.append(title.get_text(strip=True).lower())
+            h1 = soup.find('h1')
+            if h1:
+                texts.append(h1.get_text(strip=True).lower())
+            combined = ' '.join(texts)
+            return any(marker in combined for marker in ERROR_PAGE_MARKERS)
+        except Exception:
+            return False
+
     def extract_thickness_from_product_name(self, product_name):
         """
         Извлекает толщину из названия товара.
@@ -2038,45 +2075,57 @@ class PriceParserWithSheets:
         """Поиск цены по селектору с фильтрацией по названию товара"""
         try:
             soup = BeautifulSoup(html, 'html.parser')
-            
+
             if not selector or not selector.strip():
                 return None
-            
+
             elements = soup.select(selector.strip())
             if not elements:
                 return None
-            
+
+            def extract_reasonable_price(element):
+                # Отбрасываем значения, явно не похожие на цену (например,
+                # data-price="1" от виджета количества товара, а не самой
+                # цены — так на bestly.ru находилась "цена" 1 руб.)
+                price_text = element.get_text(strip=True)
+                extracted_price = self.extract_price_from_text(price_text)
+                if extracted_price and self.is_reasonable_price(extracted_price, product_name):
+                    return extracted_price
+                return None
+
             # Если элементов несколько, ищем тот, который связан с названием товара
             if len(elements) > 1 and product_name:
                 logger.info(f"Найдено {len(elements)} элементов по селектору '{selector}', ищем по названию товара...")
-                
+
                 # Сначала ищем элемент, в контексте которого есть название товара
                 for element in elements:
                     if self.find_product_by_name_in_context(element, product_name):
-                        price_text = element.get_text(strip=True)
-                        extracted_price = self.extract_price_from_text(price_text)
-                        if extracted_price:
-                            logger.info(f"Найдена цена по селектору с названием товара: {extracted_price}")
-                            return extracted_price
-                
-                # Если не нашли по названию, возвращаем первую цену
-                logger.info("Не найдено цен по названию товара, возвращаем первую цену")
-                price_text = elements[0].get_text(strip=True)
-                extracted_price = self.extract_price_from_text(price_text)
-                if extracted_price:
-                    logger.info(f"Возвращаем первую найденную цену: {extracted_price}")
-                    return extracted_price
+                        price = extract_reasonable_price(element)
+                        if price:
+                            logger.info(f"Найдена цена по селектору с названием товара: {price}")
+                            return price
+
+                # Если не нашли по названию — ищем первую цену, прошедшую
+                # проверку на разумность (а не просто первый элемент)
+                logger.info("Не найдено цен по названию товара, ищем первую разумную цену среди найденных элементов")
+                for element in elements:
+                    price = extract_reasonable_price(element)
+                    if price:
+                        logger.info(f"Возвращаем первую разумную найденную цену: {price}")
+                        return price
                 return None
-            
-            # Если элемент один или название не указано, берем первый элемент
-            price_text = elements[0].get_text(strip=True)
-            extracted_price = self.extract_price_from_text(price_text)
-            if extracted_price:
-                logger.info(f"Найдена цена по селектору '{selector}': {extracted_price}")
-                return extracted_price
-            
+
+            # Если элемент один или название не указано — берём первый элемент
+            # с разумной ценой (может быть не самый первый в списке, если
+            # селектор случайно зацепил что-то ещё)
+            for element in elements:
+                price = extract_reasonable_price(element)
+                if price:
+                    logger.info(f"Найдена цена по селектору '{selector}': {price}")
+                    return price
+
             return None
-            
+
         except Exception as e:
             logger.error(f"Ошибка поиска цены по селектору с названием: {e}")
             return None
@@ -2247,7 +2296,9 @@ class PriceParserWithSheets:
         all_texts = soup.find_all(text=re.compile(r'[\d\s.,]+(?:руб|р\.|₽|RUB|RUR)?', re.IGNORECASE))
         for text in all_texts:
             price = self.extract_price_from_text(str(text))
-            if price:
+            # Отсеиваем неправдоподобные значения (например, "404" из текста
+            # "Страница не найдена (404 Not Found)" на несуществующей странице)
+            if price and self.is_reasonable_price(price, product_name):
                 # Получаем родительский элемент для определения селектор
                 parent = text.parent
                 if parent:
@@ -2275,7 +2326,9 @@ class PriceParserWithSheets:
         for elem in soup.find_all(attrs={"data-price": True}):
             data_price = elem.get('data-price')
             price = self.extract_price_from_text(str(data_price))
-            if price:
+            # Отсеиваем неправдоподобные значения (например, data-price="1"
+            # у виджета количества товара, а не саму цену)
+            if price and self.is_reasonable_price(price, product_name):
                 selector = self._get_selector_for_element(elem)
                 has_product_name = self.find_product_by_name_in_context(elem, product_name) if product_name else True
                 
@@ -2300,16 +2353,16 @@ class PriceParserWithSheets:
             for elem in elements:
                 text = elem.get_text(strip=True)
                 price = self.extract_price_from_text(text)
-                if price:
+                if price and self.is_reasonable_price(price, product_name):
                     selector = self._get_selector_for_element(elem)
                     has_product_name = self.find_product_by_name_in_context(elem, product_name) if product_name else True
-                    
+
                     candidate_name = None
                     if has_product_name and product_name:
                         candidate_name = product_name
                     else:
                         candidate_name = self.extract_product_name_from_page(html)
-                    
+
                     price_candidates.append({
                         'price': price,
                         'text': text[:100],
@@ -3095,7 +3148,26 @@ class PriceParserWithSheets:
                     'rounding_mode': self.rounding_mode,
                     'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 }
-            
+
+            # "Мягкий" 404: сайт отдал HTTP 200, но содержимое — страница
+            # вида "товар не найден" (см. looks_like_error_page). Без этой
+            # проверки число вроде "404" из текста заглушки могло быть
+            # ошибочно принято за цену товара.
+            if self.looks_like_error_page(html):
+                logger.warning(f"Страница похожа на заглушку 'не найдено' (HTTP 200): {url}")
+                return {
+                    'index': index,
+                    'name': name,
+                    'url': url,
+                    'price': None,
+                    'characteristic': characteristic,
+                    'selector_used': selector,
+                    'best_found_selector': '',
+                    'status': 'Ссылка больше не работает (страница-заглушка «не найдено») — нужно найти новый адрес товара на сайте',
+                    'rounding_mode': self.rounding_mode,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+
             # ВАЖНО: Для Bestly используем УНИВЕРСАЛЬНЫЙ парсер таблиц
             is_bestly_page = 'bestly.ru' in domain
             

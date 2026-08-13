@@ -68,6 +68,47 @@ def make_parser():
     return p
 
 
+def make_workbook(tmpdir, name, url, selector=""):
+    """Creates a one-row test Прайс-лист workbook and returns its path."""
+    xlsx_path = os.path.join(tmpdir, "test.xlsx")
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Прайс-лист"
+    ws.append(["Название", "URL", "Цена", "Селектор", "Характеристика", "Дата обновления"])
+    ws.append([name, url, "", selector, "", ""])
+    wb.save(xlsx_path)
+    return xlsx_path
+
+
+def make_fake_response(url, text, status_code=200):
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.url = url
+    resp.encoding = 'utf-8'
+    resp.text = text
+    return resp
+
+
+def make_parser_for_product(tmpdir, name, url, selector=""):
+    """Convenience: build a workbook + loaded parser in one call."""
+    xlsx_path = make_workbook(tmpdir, name, url, selector=selector)
+    p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+    p.load_excel_data()
+    return p
+
+
+def no_selenium():
+    """
+    bestly.ru always tries Selenium first in parse_single_product(). Without
+    this patch, tests using a bestly.ru URL would make a real
+    webdriver_manager network call (to look up a chromedriver version)
+    before falling back to the mocked requests.get — slow, and a violation
+    of this suite's "no network needed" guarantee. Forces that fallback
+    immediately instead.
+    """
+    return patch.object(pps.PriceParserWithSheets, 'get_with_selenium', return_value=None)
+
+
 class SafeStrTests(unittest.TestCase):
     def test_none_returns_default(self):
         self.assertEqual(pps.safe_str(None), '')
@@ -386,37 +427,17 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
     Both cases are exercised here with mocked HTTP responses (no network).
     """
 
-    def _make_workbook(self, tmpdir, name, url, selector=""):
-        xlsx_path = os.path.join(tmpdir, "test.xlsx")
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Прайс-лист"
-        ws.append(["Название", "URL", "Цена", "Селектор", "Характеристика", "Дата обновления"])
-        ws.append([name, url, "", selector, "", ""])
-        wb.save(xlsx_path)
-        return xlsx_path
-
-    def _fake_response(self, url, text):
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.url = url
-        resp.encoding = 'utf-8'
-        resp.text = text
-        return resp
-
     def test_no_selector_does_not_crash_and_finds_price(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            xlsx_path = self._make_workbook(
+            p = make_parser_for_product(
                 tmpdir, "Композитная панель белая 4мм",
                 "https://bestly.ru/catalog/composite/x.html", selector="",
             )
-            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
-            p.load_excel_data()
-            fake_response = self._fake_response(
+            fake_response = make_fake_response(
                 "https://bestly.ru/catalog/composite/x.html",
                 "<html><body><div class='item_price'>5000 руб.</div></body></html>",
             )
-            with patch.object(pps.requests, 'get', return_value=fake_response):
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
                 result = p.parse_single_product(0, p.df.iloc[0])
 
         self.assertEqual(result['price'], 5000.0)
@@ -424,35 +445,31 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
 
     def test_wrong_selector_falls_back_without_wiping_found_price(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            xlsx_path = self._make_workbook(
+            p = make_parser_for_product(
                 tmpdir, "Композитная панель белая 4мм",
                 "https://bestly.ru/catalog/composite/x.html",
                 selector=".wrong-selector-does-not-exist",
             )
-            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
-            p.load_excel_data()
-            fake_response = self._fake_response(
+            fake_response = make_fake_response(
                 "https://bestly.ru/catalog/composite/x.html",
                 "<html><body><div class='item_price'>5000 руб.</div></body></html>",
             )
-            with patch.object(pps.requests, 'get', return_value=fake_response):
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
                 result = p.parse_single_product(0, p.df.iloc[0])
 
         self.assertEqual(result['price'], 5000.0)
 
     def test_correct_selector_still_works(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            xlsx_path = self._make_workbook(
+            p = make_parser_for_product(
                 tmpdir, "Композитная панель белая 4мм",
                 "https://bestly.ru/catalog/composite/x.html", selector=".item_price",
             )
-            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
-            p.load_excel_data()
-            fake_response = self._fake_response(
+            fake_response = make_fake_response(
                 "https://bestly.ru/catalog/composite/x.html",
                 "<html><body><div class='item_price'>5000 руб.</div></body></html>",
             )
-            with patch.object(pps.requests, 'get', return_value=fake_response):
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
                 result = p.parse_single_product(0, p.df.iloc[0])
 
         self.assertEqual(result['price'], 5000.0)
@@ -460,12 +477,10 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
 
     def test_nothing_found_is_a_clean_status_not_a_crash(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            xlsx_path = self._make_workbook(
+            p = make_parser_for_product(
                 tmpdir, "ЛДСП белый 16мм", "https://expo-torg.ru/catalog/ldsp/y.html", selector="",
             )
-            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
-            p.load_excel_data()
-            fake_response = self._fake_response(
+            fake_response = make_fake_response(
                 "https://expo-torg.ru/catalog/ldsp/y.html",
                 "<html><body><p>ничего интересного</p></body></html>",
             )
@@ -477,13 +492,11 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
 
     def test_redirected_url_is_resolved_and_written_back_to_excel(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            xlsx_path = self._make_workbook(
+            p = make_parser_for_product(
                 tmpdir, "ЛДСП белый 16мм",
                 "https://expo-torg.ru/catalog/ldsp/old-slug/?ysclid=abc123", selector="",
             )
-            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
-            p.load_excel_data()
-            fake_response = self._fake_response(
+            fake_response = make_fake_response(
                 "https://expo-torg.ru/catalog/ldsp/new-slug-16mm/",
                 "<html><body><div class='price'>1234 руб.</div></body></html>",
             )
@@ -495,7 +508,7 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
             p.results = [result]
             self.assertTrue(p.save_results_to_excel())
 
-            wb2 = load_workbook(xlsx_path)
+            wb2 = load_workbook(p.excel_file)
             saved_url = wb2["Прайс-лист"].cell(row=2, column=2).value
             self.assertEqual(saved_url, "https://expo-torg.ru/catalog/ldsp/new-slug-16mm/")
 
@@ -521,6 +534,114 @@ class ParseSingleProductRegressionTests(unittest.TestCase):
             wb2 = load_workbook(xlsx_path)
             cell = wb2["Прайс-лист"].cell(row=2, column=2).value
             self.assertIn(cell, (None, ''))
+
+
+class WrongPriceRegressionTests(unittest.TestCase):
+    """
+    Regression tests for real "wrong price" cases reported from a live
+    bestly.ru parsing run:
+      1. The generic '[data-price]' fallback selector sometimes matches a
+         quantity-stepper widget (data-price="1") instead of the actual
+         price element, so "1" was accepted as the price outright.
+      2. A "soft 404" — the site returns HTTP 200 but the page content is
+         an actual "not found" page — had its title/h1 text ("Страница не
+         найдена (404 Not Found)") auto-detected as a price of 404.
+    Both are fixed by (a) sanity-checking every extracted price with
+    is_reasonable_price() before accepting it in
+    find_price_with_selector_and_name()/find_price_and_name_on_page(), and
+    (b) looks_like_error_page() short-circuiting parse_single_product()
+    before any price search runs.
+    """
+
+    def test_data_price_quantity_widget_is_rejected_in_favor_of_real_price(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Иглопробивной ковролин EXPORADU",
+                "https://bestly.ru/catalog/exporadu.html", selector="",
+            )
+            html = (
+                "<html><body>"
+                "<div class='quantity-stepper' data-price='1'>шт.</div>"
+                "<div class='item_price'>2450 руб.</div>"
+                "</body></html>"
+            )
+            fake_response = make_fake_response("https://bestly.ru/catalog/exporadu.html", html)
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 2450.0)
+
+    def test_data_price_one_alone_is_reported_as_not_found_not_as_price_one(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Товар без реальной цены на странице",
+                "https://bestly.ru/catalog/nothing_real.html", selector="",
+            )
+            html = "<html><body><div class='quantity-stepper' data-price='1'>шт.</div></body></html>"
+            fake_response = make_fake_response("https://bestly.ru/catalog/nothing_real.html", html)
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertIsNone(result['price'])
+
+    def test_plausible_data_price_still_works(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Товар с ценой в data-price",
+                "https://bestly.ru/catalog/real_dataprice.html", selector="",
+            )
+            html = "<html><body><div data-price='3500'>3500 руб.</div></body></html>"
+            fake_response = make_fake_response("https://bestly.ru/catalog/real_dataprice.html", html)
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 3500.0)
+
+    def test_soft_404_page_is_not_mistaken_for_a_price(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Баннерная ткань литая Blackback GLP",
+                "https://bestly.ru/catalog/bannernaya_tkan_litaya_blackback_glp.html", selector="",
+            )
+            html = (
+                "<html><head><title>Страница не найдена (404 Not Found)</title></head>"
+                "<body><h1>Страница не найдена (404 Not Found)</h1></body></html>"
+            )
+            fake_response = make_fake_response(
+                "https://bestly.ru/catalog/bannernaya_tkan_litaya_blackback_glp.html", html,
+            )
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertIsNone(result['price'])
+        self.assertIn('заглушка', result['status'])
+
+    def test_sku_containing_404_does_not_false_positive(self):
+        """A product whose SKU happens to contain '404' must still parse normally."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Артикул 404XYZ товар", "https://bestly.ru/catalog/sku404.html", selector="",
+            )
+            html = (
+                "<html><head><title>Товар 404XYZ - каталог</title></head>"
+                "<body><h1>Товар 404XYZ</h1><div class='item_price'>999 руб.</div></body></html>"
+            )
+            fake_response = make_fake_response("https://bestly.ru/catalog/sku404.html", html)
+            with patch.object(pps.requests, 'get', return_value=fake_response), no_selenium():
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 999.0)
+
+    def test_looks_like_error_page_direct(self):
+        p = make_parser()
+        self.assertTrue(p.looks_like_error_page(
+            "<html><head><title>Страница не найдена</title></head><body></body></html>"
+        ))
+        self.assertFalse(p.looks_like_error_page(
+            "<html><head><title>Товар XYZ</title></head><body><div class='price'>100</div></body></html>"
+        ))
+        self.assertFalse(p.looks_like_error_page(""))
+        self.assertFalse(p.looks_like_error_page(None))
 
 
 if __name__ == '__main__':
