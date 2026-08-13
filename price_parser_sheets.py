@@ -356,17 +356,13 @@ class PriceParserWithSheets:
 
     def _thickness_regex_patterns(self, thickness, mode='boundary'):
         """
-        Возвращает regex-паттерны для поиска толщины в тексте. Режимы
-        соответствуют трем вариантам, ранее продублированным по коду:
+        Возвращает regex-паттерны для поиска толщины в тексте.
           'exact'    — ячейка таблицы целиком (^...$) плюс варианты с
                        границей слова; используется при разборе табличных
                        ячеек, где ожидается только значение толщины.
-          'boundary' — все варианты с границей слова (\\b...\\b), включая
-                       "мм"/"mm".
-          'loose'    — "мм"/"mm" ищутся БЕЗ границы слова (это исторически
-                       так и было) — то есть матчится и как часть более
-                       длинного числа (например "4мм" внутри "14мм"); только
-                       вариант с голым числом имеет границу слова.
+          'boundary' — варианты с границей слова (\\b...\\b), включая
+                       "мм"/"mm", чтобы толщина "4" не совпадала как часть
+                       более длинного числа (например "14мм").
         """
         escaped = re.escape(str(thickness))
         if mode == 'exact':
@@ -376,12 +372,6 @@ class PriceParserWithSheets:
                 f'^{escaped}$',
                 f'\\b{escaped}\\s*мм\\b',
                 f'\\b{escaped}\\s*mm\\b',
-                f'\\b{escaped}\\b',
-            ]
-        if mode == 'loose':
-            return [
-                f'{escaped}\\s*мм',
-                f'{escaped}\\s*mm',
                 f'\\b{escaped}\\b',
             ]
         # 'boundary' (по умолчанию)
@@ -1284,7 +1274,7 @@ class PriceParserWithSheets:
                 thickness = parameters['thickness']
                 
                 # Ищем толщину разными способами
-                found_thickness = self._thickness_regex_match(row_text_lower, thickness, mode='loose')
+                found_thickness = self._thickness_regex_match(row_text_lower, thickness, mode='boundary')
 
                 # Также проверяем числовое совпадение, но ИСКЛЮЧАЯ числа в ценах
                 if not found_thickness:
@@ -1374,7 +1364,7 @@ class PriceParserWithSheets:
             logger.info(f"Ищем толщину: {thickness}")
             
             # Ищем толщину разными способами
-            for pattern in self._thickness_regex_patterns(thickness, mode='loose'):
+            for pattern in self._thickness_regex_patterns(thickness, mode='boundary'):
                 match = re.search(pattern, row_text.lower())
                 if match:
                     logger.info(f"Найдена толщина по паттерну '{pattern}': {match.group()}")
@@ -1562,7 +1552,7 @@ class PriceParserWithSheets:
         """
         Проверяет, содержит ли текст указанную толщину.
         """
-        return self._text_matches_thickness(text, thickness, mode='loose', tolerance=0.1)
+        return self._text_matches_thickness(text, thickness, mode='boundary', tolerance=0.1)
 
     def find_price_in_element(self, element):
         """
