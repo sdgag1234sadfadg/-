@@ -3,12 +3,18 @@ import requests
 from bs4 import BeautifulSoup
 import time
 import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import os
 import re
 import math
+import json
+import hashlib
+import traceback
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException
@@ -16,14 +22,17 @@ from webdriver_manager.chrome import ChromeDriverManager
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 import warnings
-warnings.filterwarnings('ignore')
+# Подавляем только известный шумный DeprecationWarning от openpyxl/pandas,
+# а не все предупреждения подряд — иначе можно пропустить реальную проблему
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
-# Настройка логирования
+# Настройка логирования. Лог-файл ротируется, чтобы не расти бесконечно
+# при регулярных запусках парсера.
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('price_parser.log', encoding='utf-8'),
+        RotatingFileHandler('price_parser.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -43,7 +52,7 @@ def safe_str(value, default=''):
         if isinstance(value, float) and value != value:
             return default
         return str(value)
-    except:
+    except Exception:
         return default
 
 
@@ -133,7 +142,6 @@ class PriceParserWithSheets:
         try:
             selections_file = 'user_selections.json'
             if os.path.exists(selections_file):
-                import json
                 with open(selections_file, 'r', encoding='utf-8') as f:
                     self.user_selections = json.load(f)
                 logger.info(f"Загружено {len(self.user_selections)} сохраненных выборов пользователя")
@@ -144,7 +152,6 @@ class PriceParserWithSheets:
     def save_user_selections(self):
         """Сохранение выборов пользователя в файл"""
         try:
-            import json
             selections_file = 'user_selections.json'
             with open(selections_file, 'w', encoding='utf-8') as f:
                 json.dump(self.user_selections, f, ensure_ascii=False, indent=2)
@@ -155,8 +162,13 @@ class PriceParserWithSheets:
     def save_user_selection(self, product_url, selector, text, price):
         """Сохранение выбора пользователя для конкретного товара"""
         try:
-            # Создаем уникальный ключ на основе URL и текста элемента
-            key = f"{product_url}_{hash(selector + text)}"
+            # Создаем стабильный ключ на основе URL и текста элемента.
+            # Важно использовать hashlib, а не встроенный hash(): для строк
+            # он рандомизируется на каждый запуск процесса (PYTHONHASHSEED),
+            # из-за чего один и тот же выбор сохранялся бы под новым ключом
+            # при каждом запуске скрипта, и user_selections.json бесконтрольно рос.
+            digest = hashlib.md5((selector + text).encode('utf-8')).hexdigest()
+            key = f"{product_url}_{digest}"
             
             self.user_selections[key] = {
                 'url': product_url,
@@ -352,7 +364,7 @@ class PriceParserWithSheets:
             try:
                 self.driver.quit()
                 logger.info("Selenium драйвер закрыт")
-            except:
+            except Exception:
                 pass
             finally:
                 self.driver = None
@@ -431,7 +443,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка загрузки файла Excel: {e}")
-            import traceback
             traceback.print_exc()
             return False
     
@@ -455,7 +466,7 @@ class PriceParserWithSheets:
                     domain = domain[4:]
                 return domain
             return ''
-        except:
+        except Exception:
             return ''
     
     def extract_thickness_from_product_name(self, product_name):
@@ -520,7 +531,7 @@ class PriceParserWithSheets:
                     if 0.5 <= num <= 50:
                         logger.info(f"Извлечена толщина из цифр в названии '{product_name}': {num}мм")
                         return str(num)
-                except:
+                except Exception:
                     continue
             
             return None
@@ -696,7 +707,7 @@ class PriceParserWithSheets:
             # Конвертируем толщину в число для сравнения
             try:
                 thickness_num = float(thickness)
-            except:
+            except Exception:
                 thickness_num = None
             
             candidates = []
@@ -730,7 +741,7 @@ class PriceParserWithSheets:
                             if abs(num - thickness_num) < 0.1:
                                 found = True
                                 break
-                        except:
+                        except Exception:
                             continue
                 
                 if found:
@@ -972,7 +983,7 @@ class PriceParserWithSheets:
                                     if abs(num - float(thickness)) < 0.01:
                                         thickness_found = True
                                         break
-                                except:
+                                except Exception:
                                     continue
                         
                         if thickness_found:
@@ -1000,7 +1011,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка в универсальном парсере таблиц: {e}")
-            import traceback
             traceback.print_exc()
             return None
 
@@ -1241,7 +1251,7 @@ class PriceParserWithSheets:
                                 if not is_price_context:
                                     found_thickness = True
                                     break
-                        except:
+                        except Exception:
                             continue
                 
                 # Если толщина не найдена - строка НЕ подходит
@@ -1532,7 +1542,7 @@ class PriceParserWithSheets:
                 num = float(num_str.replace(',', '.'))
                 if abs(num - float(thickness)) < 0.1:
                     return True
-            except:
+            except Exception:
                 continue
         
         return False
@@ -1627,7 +1637,7 @@ class PriceParserWithSheets:
                                 if abs(num - float(thickness)) < 0.1:
                                     thickness_found = True
                                     break
-                            except:
+                            except Exception:
                                 continue
                     
                     if thickness_found:
@@ -1672,7 +1682,7 @@ class PriceParserWithSheets:
                             try:
                                 num = float(num_str.replace(',', '.'))
                                 numbers_float.append(num)
-                            except:
+                            except Exception:
                                 continue
                         
                         # Фильтруем числа
@@ -1731,7 +1741,7 @@ class PriceParserWithSheets:
                             thickness_val = float(found_thickness.replace(',', '.'))
                             thickness_price_map[thickness_val] = price
                             logger.info(f"Найдена толщина {thickness_val}мм с ценой {price}")
-                        except:
+                        except Exception:
                             continue
             
             # Теперь ищем цену для нужной толщины
@@ -1753,7 +1763,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка в улучшенном парсере оргстекла: {e}")
-            import traceback
             traceback.print_exc()
             return None
     
@@ -1859,7 +1868,7 @@ class PriceParserWithSheets:
                                 if abs(num - float(thickness)) < 0.01:  # Точное сравнение
                                     thickness_found = True
                                     break
-                            except:
+                            except Exception:
                                 continue
                 
                 # Ищем цвет, если он указан
@@ -1944,7 +1953,7 @@ class PriceParserWithSheets:
                             if abs(num - float(thickness)) < 0.01:
                                 score += 70
                                 break
-                    except:
+                    except Exception:
                         pass
                     
                     # Приоритет для правильного цвета
@@ -1971,7 +1980,6 @@ class PriceParserWithSheets:
                 
         except Exception as e:
             logger.error(f"Ошибка в новом парсере таблицы оргстекла: {e}")
-            import traceback
             traceback.print_exc()
             return None
         
@@ -2019,7 +2027,7 @@ class PriceParserWithSheets:
                         sibling_text = str(siblings[i]).lower()
                         if clean_product_name in sibling_text:
                             return True
-            except:
+            except Exception:
                 pass
             
             return False
@@ -2111,7 +2119,7 @@ class PriceParserWithSheets:
                             card_class = card.get_attribute('class').lower() if card.get_attribute('class') else ''
                             if any(cls in card_class for cls in ['item', 'product', 'card', 'catalog']):
                                 break
-                        except:
+                        except Exception:
                             pass
                         card = card.find_element(By.XPATH, "./..")
                     
@@ -2119,7 +2127,7 @@ class PriceParserWithSheets:
                     if price_selector:
                         try:
                             price_element = card.find_element(By.CSS_SELECTOR, price_selector)
-                        except:
+                        except Exception:
                             price_element = None
                     else:
                         price_element = None
@@ -2128,7 +2136,7 @@ class PriceParserWithSheets:
                             try:
                                 price_element = card.find_element(By.CSS_SELECTOR, sel)
                                 break
-                            except:
+                            except Exception:
                                 continue
                     
                     if price_element:
@@ -2154,7 +2162,7 @@ class PriceParserWithSheets:
                                 if price_selector:
                                     try:
                                         price_element = card.find_element(By.CSS_SELECTOR, price_selector)
-                                    except:
+                                    except Exception:
                                         price_element = None
                                 else:
                                     price_element = None
@@ -2162,16 +2170,16 @@ class PriceParserWithSheets:
                                         try:
                                             price_element = card.find_element(By.CSS_SELECTOR, sel)
                                             break
-                                        except:
+                                        except Exception:
                                             continue
                                 if price_element:
                                     price_text = price_element.text
                                     price = self.extract_price_from_text(price_text)
                                     if price:
                                         return price
-                        except:
+                        except Exception:
                             continue
-                except:
+                except Exception:
                     continue
 
             return None
@@ -2386,7 +2394,7 @@ class PriceParserWithSheets:
             tag = element.name
             return tag
             
-        except:
+        except Exception:
             return None
     
     def get_with_requests(self, url, headers=None):
@@ -2447,7 +2455,7 @@ class PriceParserWithSheets:
                 try:
                     self.driver.delete_all_cookies()
                     logger.info("Cookies очищены для Bestly")
-                except:
+                except Exception:
                     pass
             
             # Загружаем страницу
@@ -2493,9 +2501,9 @@ class PriceParserWithSheets:
                             button.click()
                             time.sleep(5)
                             logger.info("Кликнут на кнопку 'Показать еще'")
-                        except:
+                        except Exception:
                             pass
-                except:
+                except Exception:
                     pass
                     
             else:
@@ -2526,7 +2534,7 @@ class PriceParserWithSheets:
                     return page_source
                 else:
                     return None
-            except:
+            except Exception:
                 return None
         except Exception as e:
             logger.error(f"Ошибка Selenium при загрузке {url}: {str(e)[:200]}")
@@ -2701,7 +2709,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
             input("\nНажмите Enter для возврата в меню...")
 
@@ -2792,7 +2799,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
     
     def test_selector_for_product(self):
@@ -2874,7 +2880,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
             input("\nНажмите Enter для возврата в меню...")
     
@@ -3247,7 +3252,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка при парсинге товара {index+1}: {e}")
-            import traceback
             traceback.print_exc()
             
             # В случае ошибки закрываем драйвер, если он есть
@@ -3386,7 +3390,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка при парсинге всех товаров: {e}")
-            import traceback
             traceback.print_exc()
             return False
         finally:
@@ -3462,7 +3465,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка сохранения результатов: {e}")
-            import traceback
             traceback.print_exc()
             return False
     
@@ -3608,7 +3610,7 @@ class PriceParserWithSheets:
                         cell_length = len(str(cell.value)) if cell.value else 0
                         if cell_length > max_length:
                             max_length = cell_length
-                    except:
+                    except Exception:
                         pass
                 
                 # Для столбца Цена устанавливаем фиксированную ширину
@@ -3631,7 +3633,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             logger.error(f"Ошибка форматирования: {e}")
-            import traceback
             traceback.print_exc()
     
     def generate_report(self):
@@ -3830,7 +3831,6 @@ class PriceParserWithSheets:
             
         except Exception as e:
             print(f"Ошибка: {e}")
-            import traceback
             traceback.print_exc()
 
 

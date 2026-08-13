@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+price_parser.log
+user_selections.json
+*.xlsx
