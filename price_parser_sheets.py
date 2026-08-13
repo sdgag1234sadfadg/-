@@ -38,6 +38,93 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# ==========================================================================
+# Справочные данные для эвристик парсинга.
+# Раньше эти списки были разбросаны по телам методов — вынесены сюда,
+# чтобы их можно было править в одном месте, не копаясь в коде парсера.
+# ==========================================================================
+
+# Цвета, которые ищем в названии товара (extract_color_from_product_name)
+COLOR_KEYWORDS = [
+    'прозрачный', 'матовый', 'белый', 'цветной',
+    'бронза', 'молочный', 'голубой', 'зеленый',
+    'красный', 'желтый', 'черный', 'синий',
+    'оранжевый', 'фиолетовый', 'коричневый',
+]
+
+# Сокращения/варианты написания цвета -> полное название
+COLOR_VARIATIONS = {
+    'мат': 'матовый',
+    'прозр': 'прозрачный',
+    'бел': 'белый',
+    'цвет': 'цветной',
+}
+
+# Тип материала по ключевому слову в названии (extract_material_type_from_product_name)
+MATERIAL_TYPE_KEYWORDS = {
+    'поликарбонат': 'поликарбонат',
+    'polygal': 'поликарбонат',
+    'оргстекло': 'оргстекло',
+    'орг.стекло': 'оргстекло',
+    'акрил': 'акрил',
+    'пластик': 'пластик',
+    'пвх': 'пвх',
+    'пенопласт': 'пенопласт',
+    'дерево': 'дерево',
+    'металл': 'металл',
+    'алюминий': 'алюминий',
+    'сталь': 'сталь',
+    'стекло': 'стекло',
+}
+
+# Известные бренды/марки (extract_brand_from_product_name)
+KNOWN_BRANDS = [
+    'polygal', 'plazcryl', 'акрилекс', 'моногал', 'легпром',
+    'полигаль', 'плазкрил', 'akrilux', 'monogal',
+]
+
+# Тип продукта по ключевому слову (extract_product_type_from_product_name)
+PRODUCT_TYPE_KEYWORDS = {
+    'сотовый': 'сотовый',
+    'монолитный': 'монолитный',
+    'листовой': 'листовой',
+    'профилированный': 'профилированный',
+    'ячеистый': 'ячеистый',
+    'сот': 'сотовый',
+    'монолит': 'монолитный',
+}
+
+# Общие слова без смысловой нагрузки, исключаемые из ключевых слов
+# (extract_important_keywords)
+KEYWORD_STOP_WORDS = {
+    'на', 'и', 'в', 'с', 'для', 'по', 'из', 'от', 'до',
+    'мм', 'см', 'м', 'кг', 'г', 'л', 'шт', 'упак',
+    'лист', 'листа', 'листов', 'пластина', 'плита',
+}
+
+# Диапазоны "разумной" цены по товару (is_reasonable_price).
+# Правила проверяются по порядку, побеждает первое, где ВСЕ keywords
+# встречаются в названии товара (в нижнем регистре).
+PRODUCT_PRICE_RANGES = [
+    {
+        'keywords': ('поликарбонат', 'polygal', 'сотовый'),
+        'min': 5000, 'max': 20000,
+    },
+    {
+        'keywords': ('орг.стекло', 'plazcryl'),
+        'min': 5000, 'max': 30000,
+    },
+    {
+        'keywords': ('композитная панель',),
+        'min': 3000, 'max': 15000,
+    },
+]
+# Диапазон по умолчанию, если ни одно правило выше не подошло
+DEFAULT_PRICE_RANGE = (100, 50000)
+# Диапазон для случаев, когда название товара вообще не передано
+UNKNOWN_PRODUCT_PRICE_RANGE = (100, 100000)
+
+
 def safe_str(value, default=''):
     """
     Безопасное преобразование значения в строку.
@@ -260,34 +347,19 @@ class PriceParserWithSheets:
             
             # Убираем лишние пробелы и приводим к нижнему регистру
             clean_name = product_name.lower().strip()
-            
-            # Список возможных цветов
-            colors = [
-                'прозрачный', 'матовый', 'белый', 'цветной', 
-                'бронза', 'молочный', 'голубой', 'зеленый', 
-                'красный', 'желтый', 'черный', 'синий',
-                'оранжевый', 'фиолетовый', 'коричневый'
-            ]
-            
+
             # Ищем цвет в названии
-            for color in colors:
+            for color in COLOR_KEYWORDS:
                 if color in clean_name:
                     logger.info(f"Извлечен цвет из названия '{product_name}': {color}")
                     return color
-            
+
             # Также проверяем возможные вариации
-            color_variations = {
-                'мат': 'матовый',
-                'прозр': 'прозрачный',
-                'бел': 'белый',
-                'цвет': 'цветной'
-            }
-            
-            for variation, full_color in color_variations.items():
+            for variation, full_color in COLOR_VARIATIONS.items():
                 if variation in clean_name:
                     logger.info(f"Извлечен цвет из вариации '{product_name}': {full_color}")
                     return full_color
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения цвета: {e}")
@@ -1077,27 +1149,11 @@ class PriceParserWithSheets:
                 return None
             
             clean_name = product_name.lower().strip()
-            
-            material_types = {
-                'поликарбонат': 'поликарбонат',
-                'polygal': 'поликарбонат',
-                'оргстекло': 'оргстекло',
-                'орг.стекло': 'оргстекло',
-                'акрил': 'акрил',
-                'пластик': 'пластик',
-                'пвх': 'пвх',
-                'пенопласт': 'пенопласт',
-                'дерево': 'дерево',
-                'металл': 'металл',
-                'алюминий': 'алюминий',
-                'сталь': 'сталь',
-                'стекло': 'стекло'
-            }
-            
-            for keyword, material in material_types.items():
+
+            for keyword, material in MATERIAL_TYPE_KEYWORDS.items():
                 if keyword in clean_name:
                     return material
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения типа материала: {e}")
@@ -1150,13 +1206,8 @@ class PriceParserWithSheets:
                         return word
             
             # Ищем известные бренды
-            known_brands = [
-                'polygal', 'plazcryl', 'акрилекс', 'моногал', 'легпром',
-                'полигаль', 'плазкрил', 'akrilux', 'monogal'
-            ]
-            
             clean_name = product_name.lower()
-            for brand in known_brands:
+            for brand in KNOWN_BRANDS:
                 if brand in clean_name:
                     return brand
             
@@ -1175,21 +1226,11 @@ class PriceParserWithSheets:
                 return None
             
             clean_name = product_name.lower().strip()
-            
-            product_types = {
-                'сотовый': 'сотовый',
-                'монолитный': 'монолитный',
-                'листовой': 'листовой',
-                'профилированный': 'профилированный',
-                'ячеистый': 'ячеистый',
-                'сот': 'сотовый',
-                'монолит': 'монолитный'
-            }
-            
-            for keyword, product_type in product_types.items():
+
+            for keyword, product_type in PRODUCT_TYPE_KEYWORDS.items():
                 if keyword in clean_name:
                     return product_type
-            
+
             return None
         except Exception as e:
             logger.error(f"Ошибка извлечения типа продукта: {e}")
@@ -1335,20 +1376,13 @@ class PriceParserWithSheets:
             if not product_name:
                 return []   
             
-            # Общие слова, которые не несут смысловой нагрузки
-            stop_words = {
-                'на', 'и', 'в', 'с', 'для', 'по', 'из', 'от', 'до', 
-                'мм', 'см', 'м', 'кг', 'г', 'л', 'шт', 'упак',
-                'лист', 'листа', 'листов', 'пластина', 'плита'
-            }
-            
             words = re.findall(r'[а-яa-z0-9]{2,}', product_name.lower())
-            
+
             # Фильтруем стоп-слова и короткие слова
             keywords = []
             for word in words:
-                if (word not in stop_words and 
-                    len(word) > 2 and 
+                if (word not in KEYWORD_STOP_WORDS and
+                    len(word) > 2 and
                     not word.isdigit() and
                     not (word.isdigit() and len(word) < 3)):  # Исключаем маленькие числа
                     keywords.append(word)
@@ -1424,32 +1458,26 @@ class PriceParserWithSheets:
             # Базовые проверки для всех товаров
             if price <= 0:
                 return False
-            
+
             # Если имя товара не указано, используем общие проверки
             if not product_name or product_name == 'any':
-                # Общий диапазон для неизвестных товаров
-                return 100 <= price <= 100000
-            
+                low, high = UNKNOWN_PRODUCT_PRICE_RANGE
+                return low <= price <= high
+
             product_name_lower = product_name.lower()
-            
-            # Поликарбонат POLYGAL сотовый - цена за лист
-            if 'поликарбонат' in product_name_lower and 'polygal' in product_name_lower and 'сотовый' in product_name_lower:
-                # Цена за лист поликарбоната 4мм должна быть около 7686
-                return 5000 <= price <= 20000
-            
-            # Оргстекло PLAZCRYL
-            elif 'орг.стекло' in product_name_lower and 'plazcryl' in product_name_lower:
-                return 5000 <= price <= 30000
-            
-            # Композитные панели
-            elif 'композитная панель' in product_name_lower:
-                return 3000 <= price <= 15000
-            
+
+            # Ищем первое правило, для которого встречаются ВСЕ его ключевые слова
+            for rule in PRODUCT_PRICE_RANGES:
+                if all(keyword in product_name_lower for keyword in rule['keywords']):
+                    return rule['min'] <= price <= rule['max']
+
             # Общий диапазон для других товаров
-            return 100 <= price <= 50000
+            low, high = DEFAULT_PRICE_RANGE
+            return low <= price <= high
         except Exception as e:
             logger.error(f"Ошибка проверки цены: {e}")
-            return 100 <= price <= 50000  # Безопасный диапазон
+            low, high = DEFAULT_PRICE_RANGE
+            return low <= price <= high  # Безопасный диапазон
 
     def find_product_in_alternative_structures(self, html, product_name, parameters):
         """
