@@ -331,7 +331,99 @@ class PriceParserWithSheets:
         except Exception as e:
             logger.error(f"Ошибка округления цены: {e}")
             return round(price, 2)  # Возвращаем просто округленную цену при ошибке
-    
+
+    # ----------------------------------------------------------------
+    # Общие вспомогательные методы для поиска толщины в тексте.
+    # Раньше практически идентичный набор regex-паттернов и цикл
+    # числового сравнения были продублированы более чем в 7 местах
+    # (find_best_match_by_thickness, calculate_match_score,
+    # debug_row_info, check_thickness_in_text,
+    # universal_table_parsing_bestly, parse_orgsteklo_table_improved,
+    # parse_bestly_orgsteklo_table). Теперь это одно место.
+    # ----------------------------------------------------------------
+
+    def _numbers_in_text(self, text):
+        """Извлекает все числа из текста в виде float (запятая -> точка)."""
+        numbers = []
+        if not text:
+            return numbers
+        for num_str in re.findall(r'\d+(?:[.,]\d+)?', text):
+            try:
+                numbers.append(float(num_str.replace(',', '.')))
+            except ValueError:
+                continue
+        return numbers
+
+    def _thickness_regex_patterns(self, thickness, mode='boundary'):
+        """
+        Возвращает regex-паттерны для поиска толщины в тексте. Режимы
+        соответствуют трем вариантам, ранее продублированным по коду:
+          'exact'    — ячейка таблицы целиком (^...$) плюс варианты с
+                       границей слова; используется при разборе табличных
+                       ячеек, где ожидается только значение толщины.
+          'boundary' — все варианты с границей слова (\\b...\\b), включая
+                       "мм"/"mm".
+          'loose'    — "мм"/"mm" ищутся БЕЗ границы слова (это исторически
+                       так и было) — то есть матчится и как часть более
+                       длинного числа (например "4мм" внутри "14мм"); только
+                       вариант с голым числом имеет границу слова.
+        """
+        escaped = re.escape(str(thickness))
+        if mode == 'exact':
+            return [
+                f'^{escaped}\\s*мм$',
+                f'^{escaped}\\s*mm$',
+                f'^{escaped}$',
+                f'\\b{escaped}\\s*мм\\b',
+                f'\\b{escaped}\\s*mm\\b',
+                f'\\b{escaped}\\b',
+            ]
+        if mode == 'loose':
+            return [
+                f'{escaped}\\s*мм',
+                f'{escaped}\\s*mm',
+                f'\\b{escaped}\\b',
+            ]
+        # 'boundary' (по умолчанию)
+        return [
+            f'\\b{escaped}\\s*мм\\b',
+            f'\\b{escaped}\\b',
+            f'\\b{escaped}\\s*mm\\b',
+        ]
+
+    def _thickness_regex_match(self, text, thickness, mode='boundary'):
+        """Проверяет текст только по regex-паттернам толщины (без числового fallback)."""
+        if not text or not thickness:
+            return False
+        text_lower = text.lower()
+        for pattern in self._thickness_regex_patterns(thickness, mode=mode):
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        return False
+
+    def _text_matches_thickness(self, text, thickness, mode='boundary', tolerance=0.1):
+        """
+        Проверяет, соответствует ли текст указанной толщине: сначала по
+        regex-паттернам (см. _thickness_regex_patterns), затем, если не
+        нашли, по числовому совпадению с заданным допуском.
+        """
+        if not text or not thickness:
+            return False
+
+        if self._thickness_regex_match(text, thickness, mode=mode):
+            return True
+
+        try:
+            thickness_val = float(thickness)
+        except (TypeError, ValueError):
+            return False
+
+        for num in self._numbers_in_text(text.lower()):
+            if abs(num - thickness_val) < tolerance:
+                return True
+
+        return False
+
     def extract_color_from_product_name(self, product_name):
         """
         Извлекает цвет из названия товара.
@@ -776,46 +868,13 @@ class PriceParserWithSheets:
         try:
             logger.info(f"Ищем элемент с толщиной {thickness}мм среди {len(elements)} элементов")
             
-            # Конвертируем толщину в число для сравнения
-            try:
-                thickness_num = float(thickness)
-            except Exception:
-                thickness_num = None
-            
             candidates = []
-            
+
             for elem in elements:
                 text = elem['text'].lower()
-                
-                # Проверяем несколько форматов толщины
-                thickness_patterns = [
-                    f'\\b{thickness}\\s*мм\\b',
-                    f'\\b{thickness}\\b',
-                    f'\\b{thickness}\\s*mm\\b',
-                    f'\\b{thickness_num}\\b' if thickness_num else None,
-                ]
-                
-                found = False
-                for pattern in thickness_patterns:
-                    if pattern and re.search(pattern, text, re.IGNORECASE):
-                        found = True
-                        break
-                
-                # Также проверяем числа в тексте
-                if not found and thickness_num:
-                    # Ищем все числа в тексте
-                    numbers = re.findall(r'\d+(?:[.,]\d+)?', text)
-                    for num_str in numbers:
-                        try:
-                            # Заменяем запятые на точки
-                            num = float(num_str.replace(',', '.'))
-                            # Проверяем совпадение с небольшой погрешностью
-                            if abs(num - thickness_num) < 0.1:
-                                found = True
-                                break
-                        except Exception:
-                            continue
-                
+
+                found = self._text_matches_thickness(text, thickness, tolerance=0.1)
+
                 if found:
                     # Извлекаем цену из элемента
                     price = self.extract_price_from_text(text)
@@ -1027,37 +1086,12 @@ class PriceParserWithSheets:
                         # Получаем значение толщины из соответствующей колонки
                         thickness_cell = cells[thickness_col_idx]
                         thickness_text = thickness_cell.get_text(strip=True)
-                        
+
                         # Проверяем, содержит ли ячейка нужную толщину
-                        thickness_found = False
-                        
-                        # Проверяем точное совпадение (например, "4" или "4мм")
-                        thickness_patterns = [
-                            f'^{thickness}\\s*мм$',
-                            f'^{thickness}\\s*mm$',
-                            f'^{thickness}$',
-                            f'\\b{thickness}\\s*мм\\b',
-                            f'\\b{thickness}\\s*mm\\b',
-                            f'\\b{thickness}\\b'
-                        ]
-                        
-                        for pattern in thickness_patterns:
-                            if re.search(pattern, thickness_text, re.IGNORECASE):
-                                thickness_found = True
-                                break
-                        
-                        # Также проверяем числовое значение
-                        if not thickness_found:
-                            numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_text)
-                            for num_str in numbers:
-                                try:
-                                    num = float(num_str.replace(',', '.'))
-                                    if abs(num - float(thickness)) < 0.01:
-                                        thickness_found = True
-                                        break
-                                except Exception:
-                                    continue
-                        
+                        thickness_found = self._text_matches_thickness(
+                            thickness_text, thickness, mode='exact', tolerance=0.01
+                        )
+
                         if thickness_found:
                             logger.info(f"Найдена строка с толщиной {thickness}мм: '{thickness_text}'")
                             
@@ -1250,20 +1284,8 @@ class PriceParserWithSheets:
                 thickness = parameters['thickness']
                 
                 # Ищем толщину разными способами
-                found_thickness = False
-                
-                # Паттерны для поиска толщины
-                thickness_patterns = [
-                    f'{thickness}\\s*мм',
-                    f'{thickness}\\s*mm',
-                    f'\\b{thickness}\\b'
-                ]
-                
-                for pattern in thickness_patterns:
-                    if re.search(pattern, row_text_lower):
-                        found_thickness = True
-                        break
-                
+                found_thickness = self._thickness_regex_match(row_text_lower, thickness, mode='loose')
+
                 # Также проверяем числовое совпадение, но ИСКЛЮЧАЯ числа в ценах
                 if not found_thickness:
                     # Разделяем текст на слова и проверяем каждое слово отдельно
@@ -1352,20 +1374,13 @@ class PriceParserWithSheets:
             logger.info(f"Ищем толщину: {thickness}")
             
             # Ищем толщину разными способами
-            thickness_patterns = [
-                f'{thickness}\\s*мм',
-                f'{thickness}\\s*mm',
-                f'\\b{thickness}\\b'
-            ]
-            
-            for pattern in thickness_patterns:
+            for pattern in self._thickness_regex_patterns(thickness, mode='loose'):
                 match = re.search(pattern, row_text.lower())
                 if match:
                     logger.info(f"Найдена толщина по паттерну '{pattern}': {match.group()}")
-            
+
             # Ищем все числа в строке
-            numbers = re.findall(r'\d+(?:[.,]\d+)?', row_text)
-            logger.info(f"Все числа в строке: {numbers}")
+            logger.info(f"Все числа в строке: {self._numbers_in_text(row_text)}")
 
     def extract_important_keywords(self, product_name):
         """
@@ -1547,33 +1562,7 @@ class PriceParserWithSheets:
         """
         Проверяет, содержит ли текст указанную толщину.
         """
-        if not text or not thickness:
-            return False
-        
-        text_lower = text.lower()
-        
-        # Паттерны для поиска толщины
-        thickness_patterns = [
-            f'{thickness}\\s*мм',
-            f'{thickness}\\s*mm',
-            f'\\b{thickness}\\b'
-        ]
-        
-        for pattern in thickness_patterns:
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                return True
-        
-        # Также проверяем числовое значение
-        numbers = re.findall(r'\d+(?:[.,]\d+)?', text_lower)
-        for num_str in numbers:
-            try:
-                num = float(num_str.replace(',', '.'))
-                if abs(num - float(thickness)) < 0.1:
-                    return True
-            except Exception:
-                continue
-        
-        return False
+        return self._text_matches_thickness(text, thickness, mode='loose', tolerance=0.1)
 
     def find_price_in_element(self, element):
         """
@@ -1639,35 +1628,12 @@ class PriceParserWithSheets:
                     
                     # Пытаемся извлечь толщину из первой ячейки
                     thickness_cell_text = cells[0].get_text(strip=True)
-                    
+
                     # Проверяем, содержит ли ячейка нашу толщину
-                    thickness_found = False
-                    thickness_patterns = [
-                        f'^{thickness}\\s*мм$',
-                        f'^{thickness}\\s*mm$',
-                        f'^{thickness}$',
-                        f'\\b{thickness}\\s*мм\\b',
-                        f'\\b{thickness}\\s*mm\\b',
-                        f'\\b{thickness}\\b'
-                    ]
-                    
-                    for pattern in thickness_patterns:
-                        if re.search(pattern, thickness_cell_text, re.IGNORECASE):
-                            thickness_found = True
-                            break
-                    
-                    # Также проверяем числовое значение
-                    if not thickness_found:
-                        numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_cell_text)
-                        for num_str in numbers:
-                            try:
-                                num = float(num_str.replace(',', '.'))
-                                if abs(num - float(thickness)) < 0.1:
-                                    thickness_found = True
-                                    break
-                            except Exception:
-                                continue
-                    
+                    thickness_found = self._text_matches_thickness(
+                        thickness_cell_text, thickness, mode='exact', tolerance=0.1
+                    )
+
                     if thickness_found:
                         logger.info(f"Найдена строка с толщиной {thickness}мм в таблице {table_idx+1}, строка {row_idx+1}")
                         logger.info(f"Текст ячейки с толщиной: '{thickness_cell_text}'")
@@ -1868,36 +1834,12 @@ class PriceParserWithSheets:
                 # В таблице bestly.ru структура обычно: чекбокс, цвет, толщина, размер, цена
                 # Проверяем только ячейку с индексом 2 (третья ячейка - толщина)
                 thickness_found = False
-                
+
                 if len(cells) > 2:
                     thickness_cell_text = cell_texts[2]  # Третья ячейка должна быть толщиной
-                    
-                    # Проверяем точное совпадение толщины
-                    thickness_patterns = [
-                        f'^{thickness}\\s*мм$',
-                        f'^{thickness}\\s*mm$',
-                        f'^{thickness}$',
-                        f'\\b{thickness}\\s*мм\\b',
-                        f'\\b{thickness}\\s*mm\\b',
-                        f'\\b{thickness}\\b'
-                    ]
-                    
-                    for pattern in thickness_patterns:
-                        if re.search(pattern, thickness_cell_text, re.IGNORECASE):
-                            thickness_found = True
-                            break
-                    
-                    # Также проверяем числовое значение
-                    if not thickness_found:
-                        numbers = re.findall(r'\d+(?:[.,]\d+)?', thickness_cell_text)
-                        for num_str in numbers:
-                            try:
-                                num = float(num_str.replace(',', '.'))
-                                if abs(num - float(thickness)) < 0.01:  # Точное сравнение
-                                    thickness_found = True
-                                    break
-                            except Exception:
-                                continue
+                    thickness_found = self._text_matches_thickness(
+                        thickness_cell_text, thickness, mode='exact', tolerance=0.01
+                    )
                 
                 # Ищем цвет, если он указан
                 color_found = False if color else True  # Если цвет не указан, считаем, что он найден
