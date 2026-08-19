@@ -644,5 +644,136 @@ class WrongPriceRegressionTests(unittest.TestCase):
         self.assertFalse(p.looks_like_error_page(None))
 
 
+class DeadLinkRecoveryTests(unittest.TestCase):
+    """
+    Tests for recovering a dead product link by browsing its catalog
+    category (expo-torg.ru): when a product URL 404s or shows a "not
+    found" page, the category it lived in usually still exists, so we
+    open that category's listing and look for a product with a matching
+    name instead of just giving up.
+
+    The category markup used here (.product-item > .product-item-title >
+    a[href][title]) is the real markup the user copied from expo-torg.ru.
+    """
+
+    REAL_CATEGORY_HTML = """
+    <div class="product-item">
+    <a class="product-item-image-wrapper merl_sect_img" href="/catalog/plastik/bumazhno-sloistyy-plastik-hpl/kompakt-plita-3150-vl-st9-12-4200-1860-mm-svetlo-seryy-gentas/" title="Компакт-плита 3150 VL/ST9 12*4200*1860 мм Светло-серый GENTAS" data-entity="image-wrapper"></a>
+    <div class="product-item-title">
+        <a href="/catalog/plastik/bumazhno-sloistyy-plastik-hpl/kompakt-plita-3150-vl-st9-12-4200-1860-mm-svetlo-seryy-gentas/" title="Компакт-плита 3150 VL/ST9 12*4200*1860 мм Светло-серый GENTAS">Компакт-плита 3150 VL/ST9 12*4200*1860 мм Светло-серый GENTAS</a>
+    </div>
+    </div>
+    <div class="product-item">
+    <div class="product-item-title">
+        <a href="/catalog/plastik/bumazhno-sloistyy-plastik-hpl/kompakt-plita-3155-vl-st9-12-4200-1860-mm-antratsit-seryy-gentas/" title="Компакт-плита 3155 VL/ST9 12*4200*1860 мм Антрацит серый GENTAS">Компакт-плита 3155 VL/ST9 12*4200*1860 мм Антрацит серый GENTAS</a>
+    </div>
+    </div>
+    """
+    CATEGORY_URL = "https://expo-torg.ru/catalog/plastik/bumazhno-sloistyy-plastik-hpl/"
+
+    def setUp(self):
+        self.p = make_parser()
+
+    def test_derive_category_url(self):
+        self.assertEqual(
+            self.p.derive_category_url(
+                "https://expo-torg.ru/catalog/plastik/bumazhno-sloistyy-plastik-hpl/"
+                "bsp-3190-vl-st9-0-8-3050-1300-mm-chyernyy-gentas/"
+            ),
+            "https://expo-torg.ru/catalog/plastik/bumazhno-sloistyy-plastik-hpl/",
+        )
+        self.assertIsNone(self.p.derive_category_url("https://expo-torg.ru/catalog/"))
+
+    def test_parse_category_product_cards_real_markup(self):
+        cards = self.p.parse_category_product_cards(self.REAL_CATEGORY_HTML, self.CATEGORY_URL)
+        self.assertEqual(len(cards), 2)
+        self.assertTrue(cards[0]['url'].endswith('kompakt-plita-3150-vl-st9-12-4200-1860-mm-svetlo-seryy-gentas/'))
+        self.assertEqual(
+            cards[1]['name'],
+            'Компакт-плита 3155 VL/ST9 12*4200*1860 мм Антрацит серый GENTAS',
+        )
+
+    def test_match_disambiguates_near_duplicate_products(self):
+        """
+        Regression test for the exact real-world case reported: two
+        products in the same category differ only by a numeric decor code
+        (3150 vs 3155) and color (Светло-серый vs Антрацит серый). Picking
+        the wrong one would silently record the wrong product's price.
+        """
+        cards = self.p.parse_category_product_cards(self.REAL_CATEGORY_HTML, self.CATEGORY_URL)
+        target = "Компакт-плита 3155 VL/ST9 12*4200*1860 мм Антрацит серый GENTAS"
+        best, scored = self.p.find_best_category_match(cards, target)
+        self.assertIsNotNone(best, scored)
+        self.assertIn('3155', best['url'])
+        self.assertNotIn('3150', best['url'])
+
+    def test_no_confident_match_returns_none(self):
+        cards = [{'url': 'https://expo-torg.ru/catalog/x/unrelated/', 'name': 'Совершенно другой товар'}]
+        best, scored = self.p.find_best_category_match(cards, "Компакт-плита 3155 GENTAS")
+        self.assertIsNone(best)
+
+    def test_recover_dead_link_skips_bestly(self):
+        """bestly.ru has no category hierarchy to browse this way — must not attempt it."""
+        result = self.p.recover_dead_link("https://bestly.ru/catalog/exporadu.html", "Ковролин EXPORADU")
+        self.assertIsNone(result)
+
+    def test_end_to_end_dead_link_is_recovered_in_parse_single_product(self):
+        class FakeDriver:
+            def __init__(self, html):
+                self.page_source = html
+
+            def get(self, url):
+                pass
+
+            def find_elements(self, by, selector):
+                return [1, 2] if 'product-item' in selector else []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dead_url = (
+                "https://expo-torg.ru/catalog/plastik/bumazhno-sloistyy-plastik-hpl/"
+                "kompakt-plita-3155-vl-st9-12-4200-1860-mm-antratsit-seryy-gentas-OLD/"
+            )
+            replacement_url = (
+                "https://expo-torg.ru/catalog/plastik/bumazhno-sloistyy-plastik-hpl/"
+                "kompakt-plita-3155-vl-st9-12-4200-1860-mm-antratsit-seryy-gentas/"
+            )
+            p = make_parser_for_product(
+                tmpdir, "Компакт-плита 3155 VL/ST9 12*4200*1860 мм Антрацит серый GENTAS",
+                dead_url, selector="",
+            )
+
+            def fake_init_driver():
+                p.driver = FakeDriver(self.REAL_CATEGORY_HTML)
+                return True
+
+            def fake_requests_get(url, **kwargs):
+                if url == dead_url:
+                    return make_fake_response(url, "", status_code=404)
+                if url == replacement_url:
+                    return make_fake_response(url, "<html><body><div class='price-integer'>7 450</div></body></html>")
+                raise AssertionError(f"Unexpected URL requested: {url}")
+
+            with patch.object(pps.PriceParserWithSheets, 'get_with_selenium', return_value=None), \
+                 patch.object(p, 'init_selenium_driver', side_effect=fake_init_driver), \
+                 patch.object(pps.requests, 'get', side_effect=fake_requests_get):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['url'], replacement_url)
+        self.assertEqual(result['price'], 7450.0)
+
+    def test_recovery_failure_falls_back_to_dead_link_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dead_url = "https://expo-torg.ru/catalog/some-category/dead-product/"
+            p = make_parser_for_product(tmpdir, "Совсем другой товар XYZ", dead_url, selector="")
+
+            with patch.object(pps.PriceParserWithSheets, 'get_with_selenium', return_value=None), \
+                 patch.object(p, 'init_selenium_driver', return_value=False), \
+                 patch.object(pps.requests, 'get', return_value=make_fake_response(dead_url, "", status_code=404)):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertIsNone(result['price'])
+        self.assertIn('404', result['status'])
+
+
 if __name__ == '__main__':
     unittest.main()
