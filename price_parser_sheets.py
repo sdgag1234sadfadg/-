@@ -11,7 +11,7 @@ import math
 import json
 import hashlib
 import traceback
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -697,6 +697,210 @@ class PriceParserWithSheets:
             return any(marker in combined for marker in ERROR_PAGE_MARKERS)
         except Exception:
             return False
+
+    # ----------------------------------------------------------------
+    # Восстановление "умершей" ссылки на товар через раздел каталога.
+    # Если ссылка на конкретный товар больше не работает (404 или
+    # страница-заглушка), сама категория обычно продолжает существовать
+    # — пробуем открыть её и найти в списке товар с максимально похожим
+    # названием, вместо того чтобы просто сообщать "ссылка не работает".
+    # ----------------------------------------------------------------
+
+    def derive_category_url(self, product_url):
+        """
+        Отрезает от ссылки на товар последний сегмент пути, получая
+        ссылку на его категорию каталога.
+        Например: .../catalog/plastik/bumazhno-sloistyy-plastik-hpl/bsp-.../
+                -> .../catalog/plastik/bumazhno-sloistyy-plastik-hpl/
+        """
+        try:
+            parts = urlsplit(product_url)
+            segments = [s for s in parts.path.split('/') if s]
+            if len(segments) < 2:
+                return None
+            category_path = '/' + '/'.join(segments[:-1]) + '/'
+            return urlunsplit((parts.scheme, parts.netloc, category_path, '', ''))
+        except Exception:
+            return None
+
+    def get_category_listing_html(self, category_url, max_clicks=25):
+        """
+        Загружает страницу категории каталога и кликает "Показать ещё"
+        (подгрузка товаров через JS без смены ссылки), пока список не
+        перестанет расти или кнопка не пропадёт — чтобы получить полный
+        список товаров категории, а не только первую партию.
+        """
+        if not self.driver:
+            if not self.init_selenium_driver():
+                logger.error("Не удалось инициализировать Selenium для загрузки категории")
+                return None
+        try:
+            logger.info(f"Открываем категорию: {category_url}")
+            self.driver.get(category_url)
+            time.sleep(3)
+
+            previous_count = -1
+            for _ in range(max_clicks):
+                current_count = len(self.driver.find_elements(By.CSS_SELECTOR, '.product-item'))
+                if current_count == previous_count:
+                    break
+                previous_count = current_count
+                try:
+                    buttons = self.driver.find_elements(
+                        By.XPATH,
+                        "//*[contains(text(), 'Показать ещё') or contains(text(), 'Показать еще') "
+                        "or contains(text(), 'Загрузить ещё') or contains(text(), 'Загрузить еще')]"
+                    )
+                    if not buttons:
+                        break
+                    buttons[0].click()
+                    time.sleep(2)
+                except Exception as e:
+                    logger.debug(f"Не удалось кликнуть 'Показать ещё': {e}")
+                    break
+
+            return self.driver.page_source
+        except Exception as e:
+            logger.error(f"Ошибка загрузки категории {category_url}: {e}")
+            return None
+
+    def parse_category_product_cards(self, html, base_url):
+        """
+        Извлекает из HTML страницы категории список товаров (ссылка +
+        название). Рассчитано на разметку вида expo-torg.ru:
+            <div class="product-item">
+                <div class="product-item-title"><a href="..." title="...">Название</a></div>
+        """
+        cards = []
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            for item in soup.select('.product-item'):
+                link = item.select_one('.product-item-title a') or item.select_one('a[href]')
+                if not link or not link.get('href'):
+                    continue
+                name = link.get('title') or link.get_text(strip=True)
+                if not name:
+                    continue
+                cards.append({'url': urljoin(base_url, link['href']), 'name': name})
+        except Exception as e:
+            logger.error(f"Ошибка разбора карточек категории: {e}")
+        return cards
+
+    def _match_tokens(self, text):
+        """
+        Токенизирует название товара для сопоставления кандидатов в
+        find_best_category_match. В отличие от extract_important_keywords,
+        НЕ отбрасывает числовые токены: коды декора и размеры (например,
+        "3155", "4200", "1860") часто оказываются единственным отличием
+        между очень похожими товарами одной категории — например,
+        "Компакт-плита 3150 ... Светло-серый" и "3155 ... Антрацит серый"
+        отличаются именно кодом и цветом, а не структурой названия.
+        """
+        if not text:
+            return set()
+        words = re.findall(r'[а-яa-z0-9]{2,}', text.lower())
+        return {w for w in words if w not in KEYWORD_STOP_WORDS}
+
+    def find_best_category_match(self, candidates, target_name, min_ratio=0.7, min_margin=0.1):
+        """
+        Ищет среди candidates ({'url','name'}) наиболее вероятное
+        соответствие target_name. Числовые токены (коды/размеры) из
+        целевого названия ОБЯЗАНЫ присутствовать у кандидата целиком —
+        это самый надёжный признак различия между похожими товарами;
+        остальные слова (материал, цвет, бренд) используются для ранжирования.
+
+        Возвращает (кандидат, список_с_баллами) при уверенном совпадении,
+        иначе (None, список_с_баллами) — лучше не найти замену вовсе, чем
+        подставить случайно похожий, но другой товар.
+        """
+        target_tokens = self._match_tokens(target_name)
+        if not target_tokens or not candidates:
+            return None, []
+
+        target_numbers = {t for t in target_tokens if t.isdigit()}
+
+        scored = []
+        for candidate in candidates:
+            candidate_tokens = self._match_tokens(candidate['name'])
+            if not candidate_tokens:
+                continue
+            if target_numbers and not target_numbers.issubset(candidate_tokens):
+                continue
+            overlap = target_tokens & candidate_tokens
+            union = target_tokens | candidate_tokens
+            ratio = len(overlap) / len(union) if union else 0
+            scored.append({'candidate': candidate, 'ratio': ratio})
+
+        scored.sort(key=lambda x: x['ratio'], reverse=True)
+        if not scored:
+            return None, scored
+
+        best = scored[0]
+        second_ratio = scored[1]['ratio'] if len(scored) > 1 else 0
+
+        if best['ratio'] >= min_ratio and (len(scored) == 1 or (best['ratio'] - second_ratio) >= min_margin):
+            return best['candidate'], scored
+
+        return None, scored
+
+    def recover_dead_link(self, dead_url, product_name):
+        """
+        Пытается найти новый адрес товара, если старая ссылка "умерла".
+        Возвращает URL совпадения или None, если уверенного совпадения
+        не нашлось.
+        """
+        domain = self.extract_domain(dead_url)
+        if 'bestly.ru' in domain:
+            # У bestly.ru товары лежат плоско по одному .html на слаг, без
+            # вложенных категорий вида expo-torg.ru — обрезка до "каталога"
+            # дала бы весь сайт целиком, а не узкий список для сравнения.
+            return None
+
+        category_url = self.derive_category_url(dead_url)
+        if not category_url:
+            logger.warning(f"Не удалось определить категорию для {dead_url}")
+            return None
+
+        logger.info(f"Восстановление ссылки: ищем '{product_name}' в категории {category_url}")
+        html = self.get_category_listing_html(category_url)
+        if not html:
+            logger.warning(f"Не удалось загрузить категорию {category_url}")
+            return None
+
+        candidates = self.parse_category_product_cards(html, category_url)
+        if not candidates:
+            logger.warning(f"В категории {category_url} не найдено ни одной карточки товара")
+            return None
+
+        logger.info(f"В категории найдено {len(candidates)} товаров, ищем совпадение...")
+        best, scored = self.find_best_category_match(candidates, product_name)
+
+        if best:
+            logger.info(f"✓ Найдена замена ссылки: '{best['name']}' -> {best['url']}")
+            return best['url']
+
+        for entry in sorted(scored, key=lambda x: x['ratio'], reverse=True)[:3]:
+            logger.info(f"  Похожий, но неуверенный вариант ({entry['ratio']:.2f}): {entry['candidate']['name']}")
+        logger.warning(f"Не найдено уверенного совпадения для '{product_name}' в категории")
+        return None
+
+    def try_recover_and_refetch(self, dead_url, product_name, domain):
+        """
+        Ищет замену умершей ссылке (recover_dead_link) и сразу же
+        загружает найденную страницу через requests. Возвращает
+        (новый_url, html) при успехе, иначе (None, None).
+        """
+        replacement_url = self.recover_dead_link(dead_url, product_name)
+        if not replacement_url:
+            return None, None
+
+        headers = self.site_configs.get(domain, {}).get('headers', {})
+        new_html = self.get_with_requests(replacement_url, headers)
+        if not new_html or self.looks_like_error_page(new_html):
+            logger.warning(f"Найденная замена ссылки тоже не открылась: {replacement_url}")
+            return None, None
+
+        return replacement_url, new_html
 
     def extract_thickness_from_product_name(self, product_name):
         """
@@ -3132,41 +3336,55 @@ class PriceParserWithSheets:
                     domain = self.extract_domain(url)
 
             if not html:
-                if self.last_status_code == 404:
-                    status = 'Ссылка больше не работает (404) — нужно найти новый адрес товара на сайте'
+                was_404 = (self.last_status_code == 404)
+                logger.warning(f"Ссылка не открылась, пробуем найти товар в каталоге: {url}")
+                recovered_url, recovered_html = self.try_recover_and_refetch(url, name, domain)
+                if recovered_url and recovered_html:
+                    url = recovered_url
+                    domain = self.extract_domain(url)
+                    html = recovered_html
                 else:
-                    status = 'Не удалось загрузить страницу'
-                return {
-                    'index': index,
-                    'name': name,
-                    'url': url,
-                    'price': None,
-                    'characteristic': characteristic,
-                    'selector_used': selector,
-                    'best_found_selector': '',
-                    'status': status,
-                    'rounding_mode': self.rounding_mode,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
+                    if was_404:
+                        status = 'Ссылка больше не работает (404), похожий товар в каталоге не найден — нужно найти новый адрес вручную'
+                    else:
+                        status = 'Не удалось загрузить страницу'
+                    return {
+                        'index': index,
+                        'name': name,
+                        'url': url,
+                        'price': None,
+                        'characteristic': characteristic,
+                        'selector_used': selector,
+                        'best_found_selector': '',
+                        'status': status,
+                        'rounding_mode': self.rounding_mode,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
 
             # "Мягкий" 404: сайт отдал HTTP 200, но содержимое — страница
             # вида "товар не найден" (см. looks_like_error_page). Без этой
             # проверки число вроде "404" из текста заглушки могло быть
             # ошибочно принято за цену товара.
             if self.looks_like_error_page(html):
-                logger.warning(f"Страница похожа на заглушку 'не найдено' (HTTP 200): {url}")
-                return {
-                    'index': index,
-                    'name': name,
-                    'url': url,
-                    'price': None,
-                    'characteristic': characteristic,
-                    'selector_used': selector,
-                    'best_found_selector': '',
-                    'status': 'Ссылка больше не работает (страница-заглушка «не найдено») — нужно найти новый адрес товара на сайте',
-                    'rounding_mode': self.rounding_mode,
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
+                logger.warning(f"Страница похожа на заглушку 'не найдено' (HTTP 200), пробуем найти товар в каталоге: {url}")
+                recovered_url, recovered_html = self.try_recover_and_refetch(url, name, domain)
+                if recovered_url and recovered_html:
+                    url = recovered_url
+                    domain = self.extract_domain(url)
+                    html = recovered_html
+                else:
+                    return {
+                        'index': index,
+                        'name': name,
+                        'url': url,
+                        'price': None,
+                        'characteristic': characteristic,
+                        'selector_used': selector,
+                        'best_found_selector': '',
+                        'status': 'Ссылка больше не работает (страница-заглушка «не найдено»), похожий товар в каталоге не найден — нужно найти новый адрес вручную',
+                        'rounding_mode': self.rounding_mode,
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    }
 
             # ВАЖНО: Для Bestly используем УНИВЕРСАЛЬНЫЙ парсер таблиц
             is_bestly_page = 'bestly.ru' in domain
