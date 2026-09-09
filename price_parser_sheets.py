@@ -569,6 +569,32 @@ class PriceParserWithSheets:
             finally:
                 self.driver = None
     
+    def get_column_indices(self, ws):
+        """
+        Определяет номера столбцов листа Excel по заголовку (Название,
+        Цена, URL, Селектор, Характеристика, Дата обновления) —
+        независимо от их порядка на листе.
+        """
+        col_indices = {}
+        for col in range(1, ws.max_column + 1):
+            cell_value = ws.cell(row=1, column=col).value
+            if not cell_value:
+                continue
+            col_name = str(cell_value).strip().lower()
+            if 'название' in col_name:
+                col_indices['Название'] = col
+            elif 'цена' in col_name and 'за м2' not in col_name:
+                col_indices['Цена'] = col
+            elif 'url' in col_name or 'ссылка' in col_name:
+                col_indices['URL'] = col
+            elif 'селектор' in col_name:
+                col_indices['Селектор'] = col
+            elif 'характеристика' in col_name:
+                col_indices['Характеристика'] = col
+            elif 'дата' in col_name and 'обнов' in col_name:
+                col_indices['Дата обновления'] = col
+        return col_indices
+
     def load_excel_data(self):
         """Загрузка данных из Excel файла с указанного листа"""
         try:
@@ -2835,6 +2861,181 @@ class PriceParserWithSheets:
             self.close_selenium_driver()
             return None
     
+    def edit_or_add_product(self):
+        """
+        Меню-обёртка: найти и отредактировать существующий товар
+        (включая ссылку) или быстро добавить новый товар в прайс-лист.
+        """
+        try:
+            if not self.load_excel_data():
+                print("Не удалось загрузить данные из Excel")
+                return
+
+            print(f"\nВсего товаров: {len(self.df)}")
+            print("1. Найти и отредактировать существующий товар")
+            print("2. Добавить новый товар")
+            print("0. Отмена")
+            action = input("\nВаш выбор: ").strip()
+
+            if action == '1':
+                self._find_and_edit_product()
+            elif action == '2':
+                self._add_new_product()
+            else:
+                print("Отмена")
+        except Exception as e:
+            print(f"Ошибка: {e}")
+            traceback.print_exc()
+
+    def _find_and_edit_product(self):
+        """Ищет товар по части названия и позволяет отредактировать
+        название/ссылку/селектор/характеристику."""
+        query = input("\nВведите часть названия товара для поиска: ").strip().lower()
+        if not query:
+            print("Пустой запрос, отмена")
+            return
+
+        matches = [
+            idx for idx in range(len(self.df))
+            if query in safe_str(self.df.iloc[idx].get('Название', '')).lower()
+        ]
+
+        if not matches:
+            print("Ничего не найдено")
+            return
+
+        shown = matches[:50]
+        print(f"\nНайдено {len(matches)} товар(ов){' (показаны первые 50, уточните запрос)' if len(matches) > 50 else ''}:")
+        for pos, idx in enumerate(shown, 1):
+            row = self.df.iloc[idx]
+            name = safe_str(row.get('Название'), f'Товар {idx + 1}')
+            url = safe_str(row.get('URL', ''))
+            print(f"{pos:3}. [строка {idx + 1}] {name[:70]}")
+            print(f"      URL: {url[:90] if url else '(не указан)'}")
+
+        choice = input("\nНомер товара из списка выше для редактирования (0 — отмена): ").strip()
+        if not choice.isdigit() or int(choice) == 0:
+            print("Отмена")
+            return
+
+        pos = int(choice) - 1
+        if pos < 0 or pos >= len(shown):
+            print("Неверный номер")
+            return
+        idx = shown[pos]
+
+        row = self.df.iloc[idx]
+        current = {
+            'Название': safe_str(row.get('Название'), f'Товар {idx + 1}'),
+            'URL': safe_str(row.get('URL', '')),
+            'Селектор': safe_str(row.get('Селектор', '')),
+            'Характеристика': safe_str(row.get('Характеристика', '')),
+        }
+
+        print(f"\nРедактирование товара #{idx + 1}: {current['Название']}")
+        print("Для каждого поля: Enter — оставить как есть, '-' — очистить поле, иначе ввести новое значение")
+
+        updates = {}
+        for field in ('Название', 'URL', 'Селектор', 'Характеристика'):
+            raw = input(f"{field} [{current[field] or '(пусто)'}]: ").strip()
+            if raw == '':
+                continue
+            updates[field] = '' if raw == '-' else raw
+
+        if not updates:
+            print("Ничего не изменено")
+            return
+
+        # Убираем трекинг-параметры (ysclid, utm_* и т.п.) из новой ссылки —
+        # так же, как это делается при обычном парсинге
+        if 'URL' in updates and updates['URL']:
+            updates['URL'] = strip_tracking_params(updates['URL'])
+
+        # Если ссылка меняется на другую, старый сохранённый выбор селектора
+        # (привязанный к старому URL) больше не относится к этому товару —
+        # он просто перестанет находиться по новому URL и не помешает.
+
+        if self._write_product_fields(idx, updates):
+            print("✓ Изменения сохранены в Excel")
+            for field, value in updates.items():
+                print(f"  {field}: {value if value else '(очищено)'}")
+        else:
+            print("✗ Ошибка сохранения изменений")
+
+    def _write_product_fields(self, row_index, updates):
+        """
+        Записывает updates (словарь поле -> новое значение, поле из
+        Название/URL/Селектор/Характеристика) в строку row_index (0-based,
+        без учёта заголовка) листа Excel. Недостающие столбцы (например,
+        "Характеристика") создаёт по мере необходимости.
+        """
+        try:
+            wb = load_workbook(self.excel_file)
+            if self.sheet_name not in wb.sheetnames:
+                logger.error(f"Лист '{self.sheet_name}' не найден")
+                return False
+            ws = wb[self.sheet_name]
+
+            col_indices = self.get_column_indices(ws)
+            for field in updates:
+                if field not in col_indices:
+                    new_col = ws.max_column + 1
+                    ws.cell(row=1, column=new_col).value = field
+                    col_indices[field] = new_col
+
+            row_idx = row_index + 2  # +1 за заголовок, +1 за смещение к 1-based
+            for field, value in updates.items():
+                ws.cell(row=row_idx, column=col_indices[field]).value = value
+
+            wb.save(self.excel_file)
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка записи полей товара в Excel: {e}")
+            traceback.print_exc()
+            return False
+
+    def _add_new_product(self):
+        """Добавляет новый товар (название + ссылка, опционально селектор) отдельной строкой в конец листа."""
+        print("\nДобавление нового товара")
+        name = input("Название товара: ").strip()
+        if not name:
+            print("Название не может быть пустым, отмена")
+            return
+
+        url = input("Ссылка на товар (URL): ").strip()
+        if not url:
+            print("URL не может быть пустым, отмена")
+            return
+        url = strip_tracking_params(url)
+
+        selector = input("Селектор цены (можно оставить пустым): ").strip()
+
+        try:
+            wb = load_workbook(self.excel_file)
+            if self.sheet_name not in wb.sheetnames:
+                print(f"Лист '{self.sheet_name}' не найден")
+                return
+            ws = wb[self.sheet_name]
+
+            col_indices = self.get_column_indices(ws)
+            for field in ('Название', 'URL', 'Селектор', 'Характеристика'):
+                if field not in col_indices:
+                    new_col = ws.max_column + 1
+                    ws.cell(row=1, column=new_col).value = field
+                    col_indices[field] = new_col
+
+            new_row = ws.max_row + 1
+            ws.cell(row=new_row, column=col_indices['Название']).value = name
+            ws.cell(row=new_row, column=col_indices['URL']).value = url
+            if selector:
+                ws.cell(row=new_row, column=col_indices['Селектор']).value = selector
+
+            wb.save(self.excel_file)
+            print(f"✓ Товар добавлен (строка {new_row - 1} без учёта заголовка): {name}")
+        except Exception as e:
+            print(f"✗ Ошибка сохранения: {e}")
+            traceback.print_exc()
+
     def find_and_select_selector_for_product(self):
         """Найти и выбрать селектор для товара"""
         try:
@@ -4187,7 +4388,7 @@ def main():
         print("4. Тестировать селектор для товара")
         print("5. Проверить Selenium")
         print("6. Тестировать УНИВЕРСАЛЬНЫЙ парсер таблиц")  # НОВЫЙ ПУНКТ
-        print("7. Редактировать селекторы и характеристики вручную")
+        print("7. Найти/отредактировать товар (ссылка, селектор, характеристика) или добавить новый")
         print("8. Настроить режим округления цен")
         print("9. Принудительно сохранить все селекторы и характеристики")
         print("10. Просмотреть сохраненные выборы пользователя")
@@ -4274,85 +4475,8 @@ def main():
             parser.test_universal_parser()
 
         elif choice == '7':
-            print("\nРедактирование селекторов и характеристик вручную")
-            if parser.load_excel_data():
-                print(f"\nВсего товаров: {len(parser.df)}")
-                print("Формат: номер - название - текущий селектор - характеристика")
-                print("-" * 80)
-                
-                for i in range(min(20, len(parser.df))):
-                    row = parser.df.iloc[i]
-                    # Используем safe_str для безопасного преобразования
-                    name = safe_str(row.get('Название'), f'Товар {i+1}')
-                    selector = safe_str(row.get('Селектор', ''))
-                    characteristic = safe_str(row.get('Характеристика', ''))
-                    print(f"{i+1:3}. {name[:30]}... | Селектор: {selector} | Характеристика: {characteristic[:30]}...")
-                
-                print("-" * 80)
-                
-                edit_choice = input("\nВведите номер товара для редактирования (0 для отмены): ").strip()
-                if edit_choice.isdigit():
-                    idx = int(edit_choice) - 1
-                    if 0 <= idx < len(parser.df):
-                        row = parser.df.iloc[idx]
-                        current_selector = safe_str(row.get('Селектор', ''))
-                        current_char = safe_str(row.get('Характеристика', ''))
-                        name = safe_str(row.get('Название'), f'Товар {idx+1}')
-                        
-                        print(f"\nРедактирование товара #{idx+1}: {name}")
-                        print(f"Текущий селектор: {current_selector}")
-                        print(f"Текущая характеристика: {current_char}")
-                        
-                        new_selector = input("\nВведите новый селектор (оставьте пустым для удаления): ").strip()
-                        new_char = input("Введите новую характеристику (оставьте пустым для удаления): ").strip()
-                        
-                        if new_selector == "" and new_char == "":
-                            print("Ничего не изменено")
-                        else:
-                            # Обновляем в DataFrame
-                            if new_selector != "":
-                                parser.df.at[idx, 'Селектор'] = new_selector
-                            if new_char != "":
-                                parser.df.at[idx, 'Характеристика'] = new_char
-                            
-                            # Сохраняем в Excel
-                            try:
-                                wb = load_workbook(parser.excel_file)
-                                if parser.sheet_name in wb.sheetnames:
-                                    ws = wb[parser.sheet_name]
-                                    
-                                    # Находим колонки
-                                    sel_col = None
-                                    char_col = None
-                                    for col in range(1, ws.max_column + 1):
-                                        header = ws.cell(row=1, column=col).value
-                                        if header:
-                                            if 'селектор' in str(header).lower():
-                                                sel_col = col
-                                            elif 'характеристика' in str(header).lower():
-                                                char_col = col
-                                    
-                                    # Если колонки "Характеристика" нет, добавляем ее
-                                    if char_col is None:
-                                        char_col = ws.max_column + 1
-                                        ws.cell(row=1, column=char_col).value = "Характеристика"
-                                    
-                                    # Обновляем значения
-                                    row_idx = idx + 2
-                                    if sel_col and new_selector != "":
-                                        ws.cell(row=row_idx, column=sel_col).value = new_selector
-                                    if char_col and new_char != "":
-                                        ws.cell(row=row_idx, column=char_col).value = new_char
-                                    
-                                    wb.save(parser.excel_file)
-                                    print("✓ Изменения сохранены в Excel")
-                                else:
-                                    print("Лист не найден")
-                            except Exception as e:
-                                print(f"Ошибка сохранения: {e}")
-                    else:
-                        print("Неверный номер товара")
-        
+            parser.edit_or_add_product()
+
         elif choice == '8':
             # Настроить режим округления цен
             parser.set_rounding_mode_menu()
