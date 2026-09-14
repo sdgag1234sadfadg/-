@@ -775,5 +775,106 @@ class DeadLinkRecoveryTests(unittest.TestCase):
         self.assertIn('404', result['status'])
 
 
+class EditOrAddProductTests(unittest.TestCase):
+    """
+    Tests for the manual find/edit/add-product menu flow (menu item 7):
+    searching by (partial) product name, editing any field including the
+    URL — which the previous version of this menu item could not do at
+    all — and appending a brand new product row.
+    """
+
+    def _make_two_row_workbook(self, tmpdir):
+        xlsx_path = os.path.join(tmpdir, "test.xlsx")
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Прайс-лист"
+        ws.append(["Название", "URL", "Цена", "Селектор", "Характеристика", "Дата обновления"])
+        ws.append(["ЛДСП W908 ST2 16мм Белый Базовый Egger", "https://expo-torg.ru/old/", "2940", ".old-sel", "char", ""])
+        ws.append(["ЛДСП W960 SM 18 Белый классический Egger", "https://expo-torg.ru/other/", "4035", "", "", ""])
+        wb.save(xlsx_path)
+        return xlsx_path
+
+    def test_get_column_indices(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(
+                p.get_column_indices(ws),
+                {'Название': 1, 'URL': 2, 'Цена': 3, 'Селектор': 4, 'Характеристика': 5, 'Дата обновления': 6},
+            )
+
+    def test_write_product_fields_edits_url_and_clears_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            ok = p._write_product_fields(0, {'URL': 'https://expo-torg.ru/new-url/', 'Селектор': ''})
+            self.assertTrue(ok)
+
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(ws.cell(row=2, column=2).value, 'https://expo-torg.ru/new-url/')
+            self.assertIn(ws.cell(row=2, column=4).value, (None, ''))
+            # Untouched fields (name, characteristic) survive unchanged
+            self.assertEqual(ws.cell(row=2, column=1).value, "ЛДСП W908 ST2 16мм Белый Базовый Egger")
+            self.assertEqual(ws.cell(row=2, column=5).value, 'char')
+
+    def test_add_new_product_appends_row_and_strips_tracking_params(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            with patch('builtins.input', side_effect=[
+                "Новый товар МДФ 10мм",
+                "https://expo-torg.ru/new-product/?ysclid=abc123",
+                "",
+            ]):
+                p._add_new_product()
+
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(ws.max_row, 4)  # header + 2 existing + 1 new
+            self.assertEqual(ws.cell(row=4, column=1).value, "Новый товар МДФ 10мм")
+            self.assertEqual(ws.cell(row=4, column=2).value, "https://expo-torg.ru/new-product/")
+
+    def test_add_new_product_rejects_empty_name_or_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            with patch('builtins.input', side_effect=["", ]):
+                p._add_new_product()  # empty name -> bail out before asking for URL
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(ws.max_row, 3)  # unchanged: header + 2 existing rows
+
+    def test_find_and_edit_product_by_search_updates_url(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            p.load_excel_data()
+            with patch('builtins.input', side_effect=[
+                "w908",   # search query matches only the first row
+                "1",      # pick it
+                "",       # keep Название
+                "https://expo-torg.ru/found-and-fixed/",  # new URL
+                "-",      # clear Селектор
+                "",       # keep Характеристика
+            ]):
+                p._find_and_edit_product()
+
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(ws.cell(row=2, column=2).value, "https://expo-torg.ru/found-and-fixed/")
+            self.assertIn(ws.cell(row=2, column=4).value, (None, ''))
+            self.assertEqual(ws.cell(row=2, column=5).value, 'char')
+
+    def test_find_and_edit_product_no_match_does_not_crash(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            p.load_excel_data()
+            with patch('builtins.input', side_effect=["совершенно левый запрос без совпадений"]):
+                p._find_and_edit_product()  # must not raise
+
+            # Nothing changed
+            ws = load_workbook(xlsx_path)["Прайс-лист"]
+            self.assertEqual(ws.cell(row=2, column=2).value, "https://expo-torg.ru/old/")
+
+
 if __name__ == '__main__':
     unittest.main()
