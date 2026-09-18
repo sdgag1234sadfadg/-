@@ -214,7 +214,10 @@ class PriceParserWithSheets:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                }
+                },
+                'price_selectors': [
+                    '.product-item-detail-price-current',
+                ]
             },
             'bestly.ru': {
                 'name': 'Bestly',
@@ -275,7 +278,10 @@ class PriceParserWithSheets:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                }
+                },
+                'price_selectors': [
+                    '.product-item-detail-price-current',
+                ]
             }
         }
     
@@ -2525,31 +2531,34 @@ class PriceParserWithSheets:
                 if table_price:
                     found_name = self.extract_product_name_from_page(html)
                     prices_found.append({
-                        'price': table_price, 
-                        'method': 'bestly_table_parser', 
+                        'price': table_price,
+                        'method': 'bestly_table_parser',
                         'selector': 'table parsing',
                         'product_name': found_name
                     })
                     logger.info(f"Найдена цена через новый парсер таблицы: {table_price}")
-            
-            # Также пробуем специальные селекторы
-            bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-            logger.info(f"Используем специальные селекторы для Bestly: {len(bestly_selectors)} селекторов")
-            
-            for sel in bestly_selectors:
+
+        # Известные селекторы конкретного сайта (не только bestly.ru) —
+        # надёжнее общего автопоиска ниже, который иногда цепляет случайное
+        # число со страницы вместо настоящей цены.
+        site_selectors = self.site_configs.get(self.extract_domain(url), {}).get('price_selectors', [])
+        if site_selectors:
+            logger.info(f"Используем известные селекторы сайта ({len(site_selectors)})...")
+
+            for sel in site_selectors:
                 price = self.find_price_with_selector_and_name(html, sel, product_name)
                 if price:
                     # Ищем название товара на странице
                     found_name = self.extract_product_name_from_page(html)
                     prices_found.append({
-                        'price': price, 
-                        'method': 'bestly_specific_with_name', 
+                        'price': price,
+                        'method': 'site_specific_with_name',
                         'selector': sel,
                         'product_name': found_name
                     })
-                    logger.info(f"Найдена цена по селектору Bestly '{sel}' с названием: {price}")
+                    logger.info(f"Найдена цена по известному селектору сайта '{sel}' с названием: {price}")
                     break
-        
+
         # Пробуем найти все элементы с числами, которые могут быть ценами
         soup = BeautifulSoup(html, 'html.parser')
         
@@ -3729,10 +3738,17 @@ class PriceParserWithSheets:
             #     обнулял уже найденную best_price обратно в None.
             # Оба случая тихо превращали найденную цену в "Цена не найдена".
             if not best_price:
-                if 'bestly.ru' in domain:
-                    logger.info("Для Bestly ищем специальные селекторы...")
-                    bestly_selectors = self.site_configs.get('bestly.ru', {}).get('price_selectors', [])
-                    for sel in bestly_selectors:
+                # Селекторы, известные для конкретного сайта (site_configs),
+                # пробуем раньше, чем общий автопоиск по всей странице —
+                # так надёжнее: например, на msk.standart.pro и expo-torg.ru
+                # известный класс .product-item-detail-price-current
+                # указывает точно на нужную цену, а общий автопоиск иногда
+                # цепляет случайное число со страницы (например, "цену за 1
+                # лист" или другой показатель рядом с настоящей ценой).
+                site_selectors = self.site_configs.get(domain, {}).get('price_selectors', [])
+                if site_selectors:
+                    logger.info(f"Ищем по известным селекторам сайта ({len(site_selectors)})...")
+                    for sel in site_selectors:
                         price = self.find_price_with_selector_and_name(html, sel, name)
                         if price:
                             found_product_name = self.extract_product_name_from_page(html)
@@ -3742,9 +3758,9 @@ class PriceParserWithSheets:
                             best_price = price
                             best_selector = sel
                             best_found_selector = sel
-                            best_method = 'bestly_specific_with_name'
-                            status = f"Успешно (специальный селектор Bestly: {sel})"
-                            logger.info(f"✓ Цена найдена по специальному селектору Bestly '{sel}' с названием: {best_price} руб.")
+                            best_method = 'site_specific_with_name'
+                            status = f"Успешно (известный селектор сайта: {sel})"
+                            logger.info(f"✓ Цена найдена по известному селектору сайта '{sel}' с названием: {best_price} руб.")
                             break
 
                 if not best_price:
