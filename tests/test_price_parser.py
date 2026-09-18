@@ -16,6 +16,7 @@ Selenium и webdriver_manager не обязательны для запуска 
 """
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import types
@@ -825,7 +826,8 @@ class EditOrAddProductTests(unittest.TestCase):
             with patch('builtins.input', side_effect=[
                 "Новый товар МДФ 10мм",
                 "https://expo-torg.ru/new-product/?ysclid=abc123",
-                "",
+                "",  # unit -> defaults to 'шт.'
+                "",  # selector
             ]):
                 p._add_new_product()
 
@@ -833,6 +835,8 @@ class EditOrAddProductTests(unittest.TestCase):
             self.assertEqual(ws.max_row, 4)  # header + 2 existing + 1 new
             self.assertEqual(ws.cell(row=4, column=1).value, "Новый товар МДФ 10мм")
             self.assertEqual(ws.cell(row=4, column=2).value, "https://expo-torg.ru/new-product/")
+            col_indices = p.get_column_indices(ws)
+            self.assertEqual(ws.cell(row=4, column=col_indices['Единица']).value, 'шт.')
 
     def test_add_new_product_rejects_empty_name_or_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -842,6 +846,36 @@ class EditOrAddProductTests(unittest.TestCase):
                 p._add_new_product()  # empty name -> bail out before asking for URL
             ws = load_workbook(xlsx_path)["Прайс-лист"]
             self.assertEqual(ws.max_row, 3)  # unchanged: header + 2 existing rows
+
+    def test_add_new_product_fills_first_empty_row_not_after_blank_gap(self):
+        """
+        Regression test: a real report showed a new product appended way
+        below several pre-formatted-but-empty rows instead of into the
+        first of them, because ws.max_row in openpyxl counts any touched
+        (even just styled) cell, not just rows with real data.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = self._make_two_row_workbook(tmpdir)
+            wb = load_workbook(xlsx_path)
+            ws = wb["Прайс-лист"]
+            # Simulate leftover "touched but empty" rows (e.g. just a unit
+            # pre-filled, like in the reported spreadsheet) after row 3
+            for r in (4, 5, 6):
+                ws.cell(row=r, column=2).value = None  # touch the row without real data
+                ws.cell(row=r, column=1).value = None
+            ws.cell(row=4, column=3).value = None
+            wb.save(xlsx_path)
+
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+            with patch('builtins.input', side_effect=[
+                "Новый товар", "https://expo-torg.ru/gap-fill/", "", "",
+            ]):
+                p._add_new_product()
+
+            ws2 = load_workbook(xlsx_path)["Прайс-лист"]
+            # Must land in row 4 (the first empty one), not after row 6
+            self.assertEqual(ws2.cell(row=4, column=1).value, "Новый товар")
+            self.assertEqual(ws2.cell(row=4, column=2).value, "https://expo-torg.ru/gap-fill/")
 
     def test_find_and_edit_product_by_search_updates_url(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -874,6 +908,137 @@ class EditOrAddProductTests(unittest.TestCase):
             # Nothing changed
             ws = load_workbook(xlsx_path)["Прайс-лист"]
             self.assertEqual(ws.cell(row=2, column=2).value, "https://expo-torg.ru/old/")
+
+
+class GetWithSeleniumScrollTests(unittest.TestCase):
+    """
+    Regression tests for the reduced-depth scroll in get_with_selenium()'s
+    bestly.ru branch: a real report showed the parser sometimes picking up
+    a DIFFERENT product's price after scrolling deep into the page (e.g. a
+    "similar products" section further down). Scrolling is now capped at
+    ~50% of the page height, and stops as soon as price-like elements
+    appear instead of being forced through a fixed minimum number of
+    scrolls first (previously i >= 3, i.e. at least 4 scrolls).
+    """
+
+    def _make_fake_driver(self, appear_after_calls, scroll_height=10000):
+        from selenium.common.exceptions import NoSuchElementException
+
+        class FakeDriver:
+            def __init__(self):
+                self.calls = 0
+                self.scroll_positions = []
+
+            def get(self, url):
+                pass
+
+            def set_page_load_timeout(self, t):
+                pass
+
+            def delete_all_cookies(self):
+                pass
+
+            def execute_script(self, script):
+                if 'scrollHeight' in script:
+                    return scroll_height
+                if 'scrollTo' in script:
+                    m = re.search(r'scrollTo\(0,\s*([\d.]+)\)', script)
+                    if m:
+                        self.scroll_positions.append(float(m.group(1)))
+                    return None
+                return None
+
+            def find_element(self, by, selector):
+                # Используется WebDriverWait/EC.presence_of_element_located
+                # для начальной проверки — всегда "не найдено", чтобы тест
+                # обязательно прошёл по ветке прокрутки.
+                raise NoSuchElementException("not yet")
+
+            def find_elements(self, by, selector):
+                self.calls += 1
+                return [object()] if self.calls >= appear_after_calls else []
+
+            @property
+            def page_source(self):
+                return "<html>" + ("x" * 2000) + "</html>"
+
+        return FakeDriver()
+
+    def test_scroll_never_exceeds_half_of_page_height(self):
+        p = make_parser()
+        p.driver = self._make_fake_driver(appear_after_calls=999, scroll_height=10000)
+        with patch.object(pps.time, 'sleep', return_value=None):
+            p.get_with_selenium("https://bestly.ru/catalog/x.html", wait_time=1)
+        self.assertTrue(p.driver.scroll_positions, "expected at least one scroll")
+        self.assertTrue(all(pos <= 5000 for pos in p.driver.scroll_positions), p.driver.scroll_positions)
+
+    def test_scroll_stops_as_soon_as_prices_found(self):
+        p = make_parser()
+        # Цены "находятся" уже на первой прокрутке — раньше код всё равно
+        # требовал минимум 4 прокрутки (i >= 3), прежде чем остановиться.
+        p.driver = self._make_fake_driver(appear_after_calls=1, scroll_height=10000)
+        with patch.object(pps.time, 'sleep', return_value=None):
+            p.get_with_selenium("https://bestly.ru/catalog/x.html", wait_time=1)
+        self.assertEqual(len(p.driver.scroll_positions), 1, p.driver.scroll_positions)
+
+
+class MskStandartProSiteTests(unittest.TestCase):
+    """
+    Support for msk.standart.pro: it shares the exact same price markup
+    convention as expo-torg.ru (.product-item-detail-price-current), so
+    registering it in site_configs (method 'requests', browser headers)
+    is enough — no site-specific parsing code is needed. Verifies both
+    the manually-set-selector path and the generic auto-detect fallback
+    against the real markup the user provided.
+    """
+
+    REAL_PRICE_HTML = """
+    <html><body>
+    <div class="catalog-item__price">
+        <div class="product-item-detail-price-current" id="bx_117848907_14005_price">
+            <span>5 095</span> руб.
+        </div>
+    </div>
+    </body></html>
+    """
+    PRODUCT_URL = (
+        "https://msk.standart.pro/catalog/laminirovannaya_plita/ldsp_egger/"
+        "ldsp_egger_2_80_2_07_16_mm_u968_st9_seryy_ugol/"
+    )
+
+    def test_domain_recognized_and_configured_for_requests(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL, selector="",
+            )
+        self.assertEqual(p.extract_domain(self.PRODUCT_URL), "msk.standart.pro")
+        config = p.site_configs.get("msk.standart.pro")
+        self.assertIsNotNone(config)
+        self.assertEqual(config.get('method'), 'requests')
+
+    def test_price_found_via_explicit_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL,
+                selector=".product-item-detail-price-current",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 5095.0)
+        self.assertIn('указанный селектор', result['status'])
+
+    def test_price_found_without_any_selector_via_auto_detect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 5095.0)
 
 
 if __name__ == '__main__':

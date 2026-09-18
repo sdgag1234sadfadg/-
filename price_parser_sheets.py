@@ -267,6 +267,15 @@ class PriceParserWithSheets:
                 'headers': {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
                 }
+            },
+            'msk.standart.pro': {
+                'name': 'Стандарт',
+                'method': 'requests',
+                'headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                }
             }
         }
     
@@ -572,7 +581,7 @@ class PriceParserWithSheets:
     def get_column_indices(self, ws):
         """
         Определяет номера столбцов листа Excel по заголовку (Название,
-        Цена, URL, Селектор, Характеристика, Дата обновления) —
+        Единица, Цена, URL, Селектор, Характеристика, Дата обновления) —
         независимо от их порядка на листе.
         """
         col_indices = {}
@@ -583,6 +592,8 @@ class PriceParserWithSheets:
             col_name = str(cell_value).strip().lower()
             if 'название' in col_name:
                 col_indices['Название'] = col
+            elif 'единица' in col_name:
+                col_indices['Единица'] = col
             elif 'цена' in col_name and 'за м2' not in col_name:
                 col_indices['Цена'] = col
             elif 'url' in col_name or 'ссылка' in col_name:
@@ -594,6 +605,29 @@ class PriceParserWithSheets:
             elif 'дата' in col_name and 'обнов' in col_name:
                 col_indices['Дата обновления'] = col
         return col_indices
+
+    def find_first_empty_product_row(self, ws, col_indices):
+        """
+        Находит первую строку, где не заполнены ни Название, ни URL —
+        то есть "по-настоящему" пустую строку для нового товара.
+
+        ws.max_row в openpyxl учитывает любую когда-либо тронутую ячейку,
+        включая отформатированные, но пустые строки (например, с заранее
+        проставленной "шт." в столбце "Единица" про запас) — из-за этого
+        добавление новой строки как ws.max_row + 1 могло прыгать НИЖЕ уже
+        существующих пустых строк, вместо того чтобы занять первую из них.
+        """
+        name_col = col_indices.get('Название')
+        url_col = col_indices.get('URL')
+        if not name_col and not url_col:
+            return ws.max_row + 1
+
+        for row in range(2, ws.max_row + 1):
+            name_val = ws.cell(row=row, column=name_col).value if name_col else None
+            url_val = ws.cell(row=row, column=url_col).value if url_col else None
+            if not name_val and not url_val:
+                return row
+        return ws.max_row + 1
 
     def load_excel_data(self):
         """Загрузка данных из Excel файла с указанного листа"""
@@ -2779,21 +2813,30 @@ class PriceParserWithSheets:
                 except TimeoutException:
                     logger.warning(f"Не дождались признаков цены за {wait_time}с, продолжаем как есть")
 
-                # Прокручиваем несколько раз для загрузки динамического контента
-                scroll_attempts = 8  # Увеличиваем количество прокруток
+                # Прокручиваем для загрузки динамического контента. Прокрутку
+                # намеренно ограничиваем верхней половиной страницы: нужный
+                # товар почти всегда находится в начале/по центру страницы,
+                # а ниже на bestly.ru часто идут смежные/похожие товары —
+                # долистав до них, можно случайно подхватить чужую цену.
+                # Останавливаемся, как только на странице появились
+                # элементы с ценой, не дожидаясь фиксированного числа
+                # прокруток — раньше это было принудительно минимум 4
+                # прокрутки, даже если цена уже нашлась на первой.
+                scroll_attempts = 4
+                max_scroll_fraction = 0.5
                 found_prices_during_scroll = False
                 for i in range(scroll_attempts):
                     try:
-                        # Прокручиваем страницу
+                        # Прокручиваем страницу не дальше max_scroll_fraction её высоты
                         scroll_height = self.driver.execute_script("return document.body.scrollHeight")
-                        current_scroll = (scroll_height / scroll_attempts) * (i + 1)
+                        current_scroll = scroll_height * max_scroll_fraction * (i + 1) / scroll_attempts
                         self.driver.execute_script(f"window.scrollTo(0, {current_scroll});")
-                        logger.info(f"Прокрутка {i+1}/{scroll_attempts} до позиции {current_scroll}")
+                        logger.info(f"Прокрутка {i+1}/{scroll_attempts} до позиции {current_scroll:.0f} (не глубже {int(max_scroll_fraction * 100)}% страницы)")
                         time.sleep(4)  # Увеличиваем ожидание после прокрутки
 
                         # Пробуем найти элементы с ценами
                         price_elements = self.driver.find_elements(By.CSS_SELECTOR, '[class*="price"], [class*="Price"], [data-price], .price, .Price')
-                        if price_elements and i >= 3:  # Если нашли цены после 4-й прокрутки
+                        if price_elements:
                             logger.info(f"Найдено {len(price_elements)} элементов с ценами после прокрутки")
                             found_prices_during_scroll = True
                             break
@@ -2995,7 +3038,8 @@ class PriceParserWithSheets:
             return False
 
     def _add_new_product(self):
-        """Добавляет новый товар (название + ссылка, опционально селектор) отдельной строкой в конец листа."""
+        """Добавляет новый товар (название, единица, ссылка, опционально
+        селектор) в первую свободную строку листа."""
         print("\nДобавление нового товара")
         name = input("Название товара: ").strip()
         if not name:
@@ -3008,6 +3052,7 @@ class PriceParserWithSheets:
             return
         url = strip_tracking_params(url)
 
+        unit = input("Единица измерения (шт./м²/лист и т.п., Enter — 'шт.'): ").strip() or 'шт.'
         selector = input("Селектор цены (можно оставить пустым): ").strip()
 
         try:
@@ -3018,14 +3063,15 @@ class PriceParserWithSheets:
             ws = wb[self.sheet_name]
 
             col_indices = self.get_column_indices(ws)
-            for field in ('Название', 'URL', 'Селектор', 'Характеристика'):
+            for field in ('Название', 'Единица', 'URL', 'Селектор', 'Характеристика'):
                 if field not in col_indices:
                     new_col = ws.max_column + 1
                     ws.cell(row=1, column=new_col).value = field
                     col_indices[field] = new_col
 
-            new_row = ws.max_row + 1
+            new_row = self.find_first_empty_product_row(ws, col_indices)
             ws.cell(row=new_row, column=col_indices['Название']).value = name
+            ws.cell(row=new_row, column=col_indices['Единица']).value = unit
             ws.cell(row=new_row, column=col_indices['URL']).value = url
             if selector:
                 ws.cell(row=new_row, column=col_indices['Селектор']).value = selector
