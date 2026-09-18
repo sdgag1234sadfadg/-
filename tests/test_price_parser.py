@@ -982,5 +982,64 @@ class GetWithSeleniumScrollTests(unittest.TestCase):
         self.assertEqual(len(p.driver.scroll_positions), 1, p.driver.scroll_positions)
 
 
+class MskStandartProSiteTests(unittest.TestCase):
+    """
+    Support for msk.standart.pro: it shares the exact same price markup
+    convention as expo-torg.ru (.product-item-detail-price-current), so
+    registering it in site_configs (method 'requests', browser headers)
+    is enough — no site-specific parsing code is needed. Verifies both
+    the manually-set-selector path and the generic auto-detect fallback
+    against the real markup the user provided.
+    """
+
+    REAL_PRICE_HTML = """
+    <html><body>
+    <div class="catalog-item__price">
+        <div class="product-item-detail-price-current" id="bx_117848907_14005_price">
+            <span>5 095</span> руб.
+        </div>
+    </div>
+    </body></html>
+    """
+    PRODUCT_URL = (
+        "https://msk.standart.pro/catalog/laminirovannaya_plita/ldsp_egger/"
+        "ldsp_egger_2_80_2_07_16_mm_u968_st9_seryy_ugol/"
+    )
+
+    def test_domain_recognized_and_configured_for_requests(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL, selector="",
+            )
+        self.assertEqual(p.extract_domain(self.PRODUCT_URL), "msk.standart.pro")
+        config = p.site_configs.get("msk.standart.pro")
+        self.assertIsNotNone(config)
+        self.assertEqual(config.get('method'), 'requests')
+
+    def test_price_found_via_explicit_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL,
+                selector=".product-item-detail-price-current",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 5095.0)
+        self.assertIn('указанный селектор', result['status'])
+
+    def test_price_found_without_any_selector_via_auto_detect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 5095.0)
+
+
 if __name__ == '__main__':
     unittest.main()
