@@ -1029,7 +1029,13 @@ class MskStandartProSiteTests(unittest.TestCase):
         self.assertEqual(result['price'], 5095.0)
         self.assertIn('указанный селектор', result['status'])
 
-    def test_price_found_without_any_selector_via_auto_detect(self):
+    def test_price_found_without_any_selector_via_known_site_selector(self):
+        """
+        With price_selectors configured for the domain, a product with no
+        selector set at all should go through the known-selector path
+        (site_specific_with_name), not fall through to the much less
+        reliable generic auto-detect scan.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             p = make_parser_for_product(
                 tmpdir, "ЛДСП U968 ST9 16мм Серый угол Egger", self.PRODUCT_URL, selector="",
@@ -1039,6 +1045,75 @@ class MskStandartProSiteTests(unittest.TestCase):
                 result = p.parse_single_product(0, p.df.iloc[0])
 
         self.assertEqual(result['price'], 5095.0)
+        self.assertIn('известный селектор сайта', result['status'])
+
+    def test_known_selector_wins_over_decoy_number_elsewhere_on_page(self):
+        """
+        Regression test for the real bug reported: a page also showing an
+        unrelated number (e.g. a per-sheet quantity, "135") alongside the
+        real price used to have the generic auto-detect fallback pick up
+        that decoy instead of the real price from
+        .product-item-detail-price-current. Now that selector is tried
+        first (as a configured site selector) and wins.
+        """
+        page_with_decoy_number = """
+        <html><body>
+        <div class="catalog-detail-add-to-cart d-flex">
+            <div class="catalog-item__price">
+                <div class="product-item-detail-price-current" id="bx_117848907_14005_price">
+                    <span>5 095</span> руб.
+                </div>
+            </div>
+            <div class="product-quantity d-flex">
+                <span>135</span>
+            </div>
+            <small class="mt-1">Цена за 1 лист</small>
+        </div>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "ЛДСП 8 мм Бетон Чикаго светло-серый", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, page_with_decoy_number)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 5095.0)
+        self.assertNotEqual(result['price'], 135.0)
+        self.assertEqual(result['best_found_selector'], '.product-item-detail-price-current')
+
+
+class SiteSpecificSelectorsGeneralizedTests(unittest.TestCase):
+    """
+    price_selectors used to only be consulted for bestly.ru (hardcoded),
+    even though other sites (expo-torg.ru) had known-good selectors
+    configured too. Both call sites — the standard-search fallback in
+    parse_single_product() and find_price_and_name_on_page() — now look
+    up site_configs for whatever domain is actually being parsed.
+    """
+
+    def test_expo_torg_price_selectors_configured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://expo-torg.ru/x/", selector="")
+        selectors = p.site_configs.get('expo-torg.ru', {}).get('price_selectors', [])
+        self.assertIn('.product-item-detail-price-current', selectors)
+
+    def test_find_price_and_name_on_page_uses_domain_specific_selectors(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://expo-torg.ru/x/", selector="")
+        html = """
+        <html><body>
+        <div class="product-item-detail-price-current">2 940 руб.</div>
+        <div class="unrelated">100500</div>
+        </body></html>
+        """
+        prices_found, _ = p.find_price_and_name_on_page(
+            html, "https://expo-torg.ru/catalog/plity/ldsp/some-product/", selector=None, product_name="ЛДСП тест",
+        )
+        self.assertTrue(prices_found)
+        self.assertEqual(prices_found[0]['price'], 2940.0)
+        self.assertEqual(prices_found[0]['method'], 'site_specific_with_name')
 
 
 if __name__ == '__main__':
