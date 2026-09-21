@@ -1116,5 +1116,62 @@ class SiteSpecificSelectorsGeneralizedTests(unittest.TestCase):
         self.assertEqual(prices_found[0]['method'], 'site_specific_with_name')
 
 
+class LedpremiumSiteTests(unittest.TestCase):
+    """
+    Support for ledpremium.ru: its price element carries Schema.org
+    microdata (itemprop="price"), the real markup the user provided:
+        <span class="item_price" itemprop="price" content="722.85">722.85</span>
+    Registered with both [itemprop="price"] (preferred — semantic markup
+    tends to survive redesigns better than a CSS class) and .item_price
+    as a fallback, method 'requests' like the other simple/static sites.
+    """
+
+    PRODUCT_URL = (
+        "https://ledpremium.ru/catalog/svetodiodnye_lenty_cob/"
+        "svetodiodnaya_lenta_sirius_cob_lp480_lh_24v_cri_85_cob_10_w_m_100_lm_w_ip33_/"
+    )
+    REAL_PRICE_HTML = """
+    <html><body>
+    <div class="product-price">
+        <span class="item_price" itemprop="price" content="722.85">722.85</span>
+    </div>
+    </body></html>
+    """
+
+    def test_domain_recognized_and_configured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", self.PRODUCT_URL, selector="")
+        self.assertEqual(p.extract_domain(self.PRODUCT_URL), "ledpremium.ru")
+        config = p.site_configs.get("ledpremium.ru")
+        self.assertIsNotNone(config)
+        self.assertEqual(config.get('method'), 'requests')
+        self.assertIn('[itemprop="price"]', config.get('price_selectors', []))
+
+    def test_price_found_without_any_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Светодиодная лента SIRIUS COB LP480 LH 24V", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 722.85)
+        self.assertEqual(result['best_found_selector'], '[itemprop="price"]')
+
+    def test_price_found_via_explicit_selector(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Светодиодная лента SIRIUS COB LP480 LH 24V", self.PRODUCT_URL,
+                selector='[itemprop="price"]',
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 722.85)
+        self.assertIn('указанный селектор', result['status'])
+
+
 if __name__ == '__main__':
     unittest.main()
