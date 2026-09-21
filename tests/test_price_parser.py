@@ -1173,5 +1173,46 @@ class LedpremiumSiteTests(unittest.TestCase):
         self.assertIn('указанный селектор', result['status'])
 
 
+class UnregisteredSiteHeadersTests(unittest.TestCase):
+    """
+    Regression test for a real bug found while adding ros-met.com: every
+    call site building headers for get_with_requests() did
+    site_configs.get(domain, {}).get('headers', {}) — for a domain with
+    no site_configs entry at all (or no 'headers' key) this evaluated to
+    {} (an empty dict), not None. get_with_requests() only substitutes
+    its sensible default browser headers when headers is None, so an
+    empty dict was passed straight to requests.get() as-is: no
+    User-Agent, no Accept-* headers at all. Many sites' bot/anti-scraping
+    protection rejects such bare requests outright — this matches a real
+    report where every ros-met.com product failed to load. Fixed by
+    dropping the {} default so an unconfigured site's headers resolve to
+    None and get the same sensible defaults as any other request.
+    """
+
+    def test_unconfigured_domain_gets_default_browser_headers(self):
+        captured = {}
+
+        def fake_get(url, headers=None, **kwargs):
+            captured['headers'] = headers
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.url = url
+            resp.encoding = 'utf-8'
+            resp.text = "<html><body><span class='price'>1234 руб.</span></body></html>"
+            return resp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Товар с незарегистрированного сайта",
+                "https://some-unregistered-site.example/product/", selector="",
+            )
+            with patch.object(pps.requests, 'get', side_effect=fake_get):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertIsNotNone(captured['headers'])
+        self.assertIn('User-Agent', captured['headers'])
+        self.assertEqual(result['price'], 1234.0)
+
+
 if __name__ == '__main__':
     unittest.main()

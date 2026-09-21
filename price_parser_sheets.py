@@ -295,6 +295,16 @@ class PriceParserWithSheets:
                     '[itemprop="price"]',
                     '.item_price',
                 ]
+            },
+            'ros-met.com': {
+                'name': 'РосМет',
+                'method': 'requests',
+                'headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+                }
+                # price_selectors пока не заданы — ждём разметку цены с сайта
             }
         }
     
@@ -973,7 +983,7 @@ class PriceParserWithSheets:
         if not replacement_url:
             return None, None
 
-        headers = self.site_configs.get(domain, {}).get('headers', {})
+        headers = self.site_configs.get(domain, {}).get('headers')
         new_html = self.get_with_requests(replacement_url, headers)
         if not new_html or self.looks_like_error_page(new_html):
             logger.warning(f"Найденная замена ссылки тоже не открылась: {replacement_url}")
@@ -3151,7 +3161,7 @@ class PriceParserWithSheets:
             if domain in self.site_configs and self.site_configs[domain].get('method') == 'selenium':
                 html = self.get_with_selenium(url)
             else:
-                headers = self.site_configs.get(domain, {}).get('headers', {})
+                headers = self.site_configs.get(domain, {}).get('headers')
                 html = self.get_with_requests(url, headers)
             
             if not html:
@@ -3407,7 +3417,7 @@ class PriceParserWithSheets:
             if domain in self.site_configs and self.site_configs[domain].get('method') == 'selenium':
                 html = self.get_with_selenium(url)
             else:
-                headers = self.site_configs.get(domain, {}).get('headers', {})
+                headers = self.site_configs.get(domain, {}).get('headers')
                 html = self.get_with_requests(url, headers)
             
             if not html:
@@ -3592,7 +3602,7 @@ class PriceParserWithSheets:
                     method = 'requests'
             
             if method == 'requests' or not html:
-                headers = self.site_configs.get(domain, {}).get('headers', {})
+                headers = self.site_configs.get(domain, {}).get('headers')
                 html = self.get_with_requests(url, headers)
 
                 # Сайт мог сделать редирект со старой ссылки на новую (например,
