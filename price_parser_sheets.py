@@ -119,6 +119,14 @@ PRODUCT_PRICE_RANGES = [
         'keywords': ('композитная панель',),
         'min': 3000, 'max': 15000,
     },
+    {
+        # Металлопрокат (трубы, профили) часто продаётся по цене за
+        # погонный метр/кг — десятки рублей, а не тысячи, как у листовых
+        # материалов выше. DEFAULT_PRICE_RANGE (от 100 руб.) отсеивал
+        # такие цены как "неразумные" наравне с настоящим мусором вроде "1".
+        'keywords': ('труба',),
+        'min': 10, 'max': 50000,
+    },
 ]
 # Диапазон по умолчанию, если ни одно правило выше не подошло
 DEFAULT_PRICE_RANGE = (100, 50000)
@@ -303,8 +311,11 @@ class PriceParserWithSheets:
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                }
-                # price_selectors пока не заданы — ждём разметку цены с сайта
+                },
+                # Сайт на WooCommerce — стандартная разметка цены этого плагина
+                'price_selectors': [
+                    '.woocommerce-Price-amount',
+                ]
             }
         }
     

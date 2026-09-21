@@ -1214,5 +1214,74 @@ class UnregisteredSiteHeadersTests(unittest.TestCase):
         self.assertEqual(result['price'], 1234.0)
 
 
+class RosMetSiteTests(unittest.TestCase):
+    """
+    Support for ros-met.com (metal/aluminum pipes, WooCommerce-based).
+    Real markup provided:
+        <span class="woocommerce-Price-amount amount">
+            <bdi>68&nbsp;<span class="woocommerce-Price-currencySymbol">₽</span></bdi>
+        </span>
+
+    Also a regression test for a second real bug found via this exact
+    price: 68 руб. was being rejected by is_reasonable_price()'s
+    DEFAULT_PRICE_RANGE (100-50000), calibrated for sheet materials
+    priced in the thousands — pipes/metal profile are commonly priced
+    per running metre at tens of rubles. Added a PRODUCT_PRICE_RANGES
+    entry for "труба" with a much lower floor (10) so genuine low prices
+    like this aren't discarded as implausible, while a real decoy value
+    like a quantity stepper's "1" is still rejected.
+    """
+
+    PRODUCT_URL = "https://ros-met.com/truba-20x20h2/"
+    REAL_PRICE_HTML = """
+    <html><body>
+    <p class="price">
+    <span class="woocommerce-Price-amount amount"><bdi>68&nbsp;<span class="woocommerce-Price-currencySymbol">₽</span></bdi></span>
+    </p>
+    </body></html>
+    """
+
+    def test_domain_recognized_and_configured(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", self.PRODUCT_URL, selector="")
+        self.assertEqual(p.extract_domain(self.PRODUCT_URL), "ros-met.com")
+        config = p.site_configs.get("ros-met.com")
+        self.assertIsNotNone(config)
+        self.assertEqual(config.get('method'), 'requests')
+        self.assertIn('.woocommerce-Price-amount', config.get('price_selectors', []))
+
+    def test_low_pipe_price_not_rejected_as_unreasonable(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Труба профильная 20х20х2", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 68.0)
+        self.assertEqual(result['best_found_selector'], '.woocommerce-Price-amount')
+
+    def test_decoy_quantity_still_rejected_alongside_low_real_price(self):
+        html_with_decoy = self.REAL_PRICE_HTML.replace(
+            '</body>', '<div class="qty">1</div></body>',
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Труба профильная 20х20х2", self.PRODUCT_URL, selector="",
+            )
+            fake_response = make_fake_response(self.PRODUCT_URL, html_with_decoy)
+            with patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 68.0)
+        self.assertNotEqual(result['price'], 1.0)
+
+    def test_is_reasonable_price_range_for_truba(self):
+        p = make_parser()
+        self.assertTrue(p.is_reasonable_price(68, "Труба профильная 20х20х2"))
+        self.assertFalse(p.is_reasonable_price(1, "Труба профильная 20х20х2"))
+
+
 if __name__ == '__main__':
     unittest.main()
