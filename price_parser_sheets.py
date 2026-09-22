@@ -2385,6 +2385,19 @@ class PriceParserWithSheets:
 
             elements = soup.select(selector.strip())
             if not elements:
+                # Частая опечатка при сохранении/вводе селектора вручную —
+                # скопировали имя CSS-класса без ведущей точки (например,
+                # "table__price-current" вместо ".table__price-current").
+                # Без точки браузерный CSS-парсер трактует это как имя
+                # HTML-тега, которого не существует, — селектор молча не
+                # находит ничего, и код тихо проваливался в куда менее
+                # надёжный общий автопоиск. Пробуем один раз как класс.
+                stripped = selector.strip()
+                if stripped and stripped[0] not in '.#[*:>,~+ ' and ' ' not in stripped:
+                    elements = soup.select(f'.{stripped}')
+                    if elements:
+                        logger.info(f"Селектор '{stripped}' не сработал как есть, но сработал как класс '.{stripped}'")
+            if not elements:
                 return None
 
             def extract_reasonable_price(element):
@@ -2599,9 +2612,15 @@ class PriceParserWithSheets:
         # Ищем элементы, содержащие цифры и возможные индикаторы цены
         price_candidates = []
         
-        # Ищем по текстовым элементам
+        # Ищем по текстовым элементам. BeautifulSoup считает содержимое
+        # <script>/<style> обычным текстовым узлом наравне с видимым текстом
+        # страницы, поэтому числа из встроенного JS (например, из блока
+        # данных для виджета "похожие товары") могли ошибочно приниматься
+        # за цену — реальный случай: цена "4223" была найдена внутри <script>.
         all_texts = soup.find_all(text=re.compile(r'[\d\s.,]+(?:руб|р\.|₽|RUB|RUR)?', re.IGNORECASE))
         for text in all_texts:
+            if text.parent and text.parent.name in ('script', 'style', 'noscript', 'template'):
+                continue
             price = self.extract_price_from_text(str(text))
             # Отсеиваем неправдоподобные значения (например, "404" из текста
             # "Страница не найдена (404 Not Found)" на несуществующей странице)

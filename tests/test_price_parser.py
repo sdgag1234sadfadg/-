@@ -1283,5 +1283,81 @@ class RosMetSiteTests(unittest.TestCase):
         self.assertFalse(p.is_reasonable_price(1, "Труба профильная 20х20х2"))
 
 
+class SelectorMissingDotAndScriptTagRegressionTests(unittest.TestCase):
+    """
+    Regression tests for two real bugs found from a full parsing log on a
+    bestly.ru composite-panel product:
+
+    1. A saved selector of "table__price-current" (missing its leading
+       '.') matches nothing via soup.select() — without a CSS prefix,
+       that string is parsed as an (nonexistent) HTML tag name, not a
+       class. The code silently treated this as "no elements" and fell
+       all the way through to the generic auto-detect fallback instead
+       of the real price element.
+    2. That auto-detect fallback's text-node scan
+       (soup.find_all(text=re.compile(...))) matched digits INSIDE
+       <script> tag content too — BeautifulSoup treats script contents as
+       an ordinary text node. The real log showed exactly this: a price
+       of "4223" was "found" with method=auto_detected, selector=script,
+       picked from a JS data blob rather than any visible page content.
+    """
+
+    def test_selector_missing_leading_dot_falls_back_to_class_match(self):
+        p = make_parser()
+        html = '<html><body><div class="table__price-current">4 223 руб.</div></body></html>'
+        price = p.find_price_with_selector_and_name(html, 'table__price-current', 'Композитная панель GROSSBOND')
+        self.assertEqual(price, 4223.0)
+
+    def test_selector_that_is_a_real_tag_name_is_not_broken(self):
+        """A selector that's genuinely a tag name (e.g. 'span') must still work as-is."""
+        p = make_parser()
+        html = '<html><body><span>999 руб.</span></body></html>'
+        price = p.find_price_with_selector_and_name(html, 'span', None)
+        self.assertEqual(price, 999.0)
+
+    def test_script_tag_content_excluded_from_auto_detect(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "x", "https://bestly.ru/catalog/x.html", selector="")
+        html = """
+        <html><body>
+        <script>var relatedProducts = [{"id":1,"price":4223},{"id":2,"price":10800}];</script>
+        <div class="something-unrelated">нет цены тут</div>
+        </body></html>
+        """
+        prices_found, _ = p.find_price_and_name_on_page(
+            html, "https://bestly.ru/catalog/x.html", selector=None, product_name="Композитная панель",
+        )
+        self.assertFalse(any(c['price'] in (4223.0, 10800.0) for c in prices_found), prices_found)
+
+    def test_full_report_scenario_end_to_end(self):
+        """
+        Mirrors the real report: a <table> present but not matched by the
+        structured table parser, decoy numbers embedded in <script> (as if
+        from a "related products" JS data blob), and the real price only
+        reachable via the saved selector once the missing dot is tolerated.
+        """
+        url = "https://bestly.ru/catalog/kompozitnaya_panel_grossbond_matovaya_g1.html"
+        real_page_html = """
+        <html><body>
+        <script>var relatedProducts = [{"id":1,"price":4223},{"id":2,"price":10800}];</script>
+        <div class="product">
+            <div class="table__price-current">4750 руб.</div>
+        </div>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Композитная панель GROSSBOND матовая 4мм 1220x4000мм", url,
+                selector="table__price-current",
+            )
+            fake_response = make_fake_response(url, real_page_html)
+            with patch.object(pps.PriceParserWithSheets, 'get_with_selenium', return_value=None), \
+                 patch.object(pps.requests, 'get', return_value=fake_response):
+                result = p.parse_single_product(0, p.df.iloc[0])
+
+        self.assertEqual(result['price'], 4750.0)
+        self.assertNotIn(result['price'], (4223.0, 10800.0))
+
+
 if __name__ == '__main__':
     unittest.main()
