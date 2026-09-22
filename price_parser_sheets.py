@@ -203,7 +203,13 @@ class PriceParserWithSheets:
         self.df = None
         self.driver = None
         self.results = []
-        self.rounding_mode = 'ceil'  # Режим округления по умолчанию
+        # Округление по умолчанию — до целого рубля в большую сторону.
+        # Раньше по умолчанию стоял 'ceil' (округление до копейки, что для
+        # прайс-листа почти ничего не меняет), но во всех реальных отчётах
+        # пользователь каждый раз вручную переключал на 'no_decimal' — теперь
+        # это и есть настоящий режим по умолчанию, без ручной перенастройки
+        # при каждом запуске.
+        self.rounding_mode = 'no_decimal'
         self.user_selections = {}  # Словарь для хранения выборов пользователя
         # Финальный URL и статус последнего запроса через get_with_requests
         # (см. этот метод — используется для самолечения "протухших" ссылок)
@@ -3152,12 +3158,16 @@ class PriceParserWithSheets:
                 return
             
             print(f"\nВсего товаров: {len(self.df)}")
-            idx_str = input("Введите номер товара для выбора селектора (начиная с 1): ").strip()
-            
+            idx_str = input("Введите номер товара для выбора селектора (начиная с 1, Enter — отмена): ").strip()
+
+            if not idx_str:
+                print("Отмена")
+                return
+
             if not idx_str.isdigit():
                 print("Неверный номер товара")
                 return
-            
+
             idx = int(idx_str) - 1
             if idx < 0 or idx >= len(self.df):
                 print("Неверный номер товара")
@@ -3340,7 +3350,10 @@ class PriceParserWithSheets:
             for i, (idx, name, url) in enumerate(bestly_products):
                 print(f"{i+1}. #{idx+1}: {name}")
             
-            choice = input("\nВыберите товар для тестирования (номер из списка): ").strip()
+            choice = input("\nВыберите товар для тестирования (номер из списка, Enter — отмена): ").strip()
+            if not choice:
+                print("Отмена")
+                return
             if not choice.isdigit():
                 print("Неверный выбор")
                 return
@@ -3411,12 +3424,16 @@ class PriceParserWithSheets:
                 return
             
             print(f"\nВсего товаров: {len(self.df)}")
-            idx_str = input("Введите номер товара для тестирования селектора (начиная с 1): ").strip()
-            
+            idx_str = input("Введите номер товара для тестирования селектора (начиная с 1, Enter — отмена): ").strip()
+
+            if not idx_str:
+                print("Отмена")
+                return
+
             if not idx_str.isdigit():
                 print("Неверный номер товара")
                 return
-            
+
             idx = int(idx_str) - 1
             if idx < 0 or idx >= len(self.df):
                 print("Неверный номер товара")
@@ -4351,11 +4368,11 @@ class PriceParserWithSheets:
         print(f"{'='*60}")
         print(f"Текущий режим: {self.rounding_mode}")
         print("\nДоступные режимы:")
-        print("1. ceil - округление в большую сторону (по умолчанию)")
+        print("1. ceil - округление до копейки в большую сторону")
         print("2. floor - округление в меньшую сторону")
         print("3. nearest - округление до ближайшего целого числа")
         print("4. nearest_decimal - округление до 2 знаков после запятой")
-        print("5. no_decimal - округление до целого числа в большую сторону")
+        print("5. no_decimal - округление до целого рубля в большую сторону (по умолчанию)")
         
         choice = input("\nВыберите режим (1-5, или Enter для отмены): ").strip()
         
@@ -4379,7 +4396,14 @@ class PriceParserWithSheets:
             if not self.load_excel_data():
                 print("Не удалось загрузить данные из Excel")
                 return
-            
+
+            confirm = input(
+                "\nПеречитать и перезаписать все селекторы/характеристики в Excel? (да/нет, Enter — отмена): "
+            ).strip().lower()
+            if confirm not in ['да', 'yes', 'y']:
+                print("Отмена")
+                return
+
             print("\nПринудительное сохранение селекторов и характеристик...")
             
             # Открываем файл для записи
@@ -4520,25 +4544,30 @@ def main():
             print("Используются СОХРАНЕННЫЕ ВЫБОРЫ ПОЛЬЗОВАТЕЛЯ")
             print("Поиск осуществляется по селектору и названию товара")
             print("Найденные характеристики сохраняются в столбец 'Характеристика'")
-            confirm = input("Запустить парсинг всех товаров? (да/нет): ").strip().lower()
+            confirm = input("Запустить парсинг всех товаров? (да/нет, Enter — отмена): ").strip().lower()
             if confirm in ['да', 'yes', 'y']:
                 if parser.parse_all_products():
                     print("\n✓ Парсинг завершен! Селекторы и характеристики сохранены.")
                 else:
                     print("\n✗ Ошибка парсинга!")
-        
+            else:
+                print("Отмена")
+
         elif choice == '2':
             if parser.load_excel_data():
                 print(f"\nВсего товаров: {len(parser.df)}")
                 print(f"Текущий режим округления: {parser.rounding_mode}")
-                start = input("Начать с позиции (начиная с 1): ").strip()
-                start = int(start) - 1 if start.isdigit() else 0
-                
-                limit = input("Сколько товаров (оставьте пустым для всех): ").strip()
-                limit = int(limit) if limit.isdigit() else None
-                
-                print(f"\nНачинаем с позиции {start+1}...")
-                parser.parse_all_products(start_from=start, limit=limit)
+                start = input("Начать с позиции (начиная с 1, Enter — отмена): ").strip()
+                if not start:
+                    print("Отмена")
+                else:
+                    start = int(start) - 1 if start.isdigit() else 0
+
+                    limit = input("Сколько товаров (оставьте пустым для всех): ").strip()
+                    limit = int(limit) if limit.isdigit() else None
+
+                    print(f"\nНачинаем с позиции {start+1}...")
+                    parser.parse_all_products(start_from=start, limit=limit)
         
         elif choice == '3':
             # Найти и выбрать селектор для товара
@@ -4549,6 +4578,10 @@ def main():
             parser.test_selector_for_product()
         
         elif choice == '5':
+            confirm = input("\nЗапустить проверку Selenium? (да/нет, Enter — отмена): ").strip().lower()
+            if confirm not in ['да', 'yes', 'y']:
+                print("Отмена")
+                continue
             print("\nПроверка Selenium...")
             if parser.init_selenium_driver():
                 print("✓ Selenium драйвер успешно инициализирован")
