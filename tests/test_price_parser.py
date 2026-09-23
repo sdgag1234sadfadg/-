@@ -278,6 +278,42 @@ class BestlyTableParsingTests(unittest.TestCase):
         price = self.p.universal_table_parsing_bestly(html, "Поликарбонат POLYGAL сотовый 4мм")
         self.assertEqual(price, 7686.0)
 
+    def test_picks_row_matching_the_specific_sheet_size_not_just_thickness(self):
+        """
+        Regression: reported bug where a product named with an explicit
+        sheet size ("...3мм 2050x3050мм") got the price of a *different*
+        row that merely matched on thickness — an unrelated 1220x2440
+        sheet listed earlier in the same table at the same thickness.
+        """
+        html = """
+        <html><body>
+        <table>
+        <tr><th>Модель</th><th>Толщина, мм</th><th>Размер, мм</th><th>Цена ₽/л.</th></tr>
+        <tr><td>белый</td><td>3</td><td>1220x2440</td><td>1 548.82</td></tr>
+        <tr><td>белый (10 шт/уп)</td><td>3</td><td>2050x3050</td><td>2 780.05</td></tr>
+        <tr><td>белый (5 шт/уп)</td><td>5</td><td>2050x3050</td><td>4 378.01</td></tr>
+        </table>
+        </body></html>
+        """
+        price = self.p.universal_table_parsing_bestly(html, "Лист ПВХ вспененный 3мм 2050x3050мм")
+        self.assertEqual(price, 2780.05)
+        self.assertNotEqual(price, 1548.82)
+
+    def test_falls_back_to_thickness_only_match_when_no_row_has_the_exact_size(self):
+        html = """
+        <html><body>
+        <table>
+        <tr><th>Модель</th><th>Толщина, мм</th><th>Размер, мм</th><th>Цена ₽/л.</th></tr>
+        <tr><td>белый</td><td>3</td><td>1220x2440</td><td>1 548.82</td></tr>
+        <tr><td>белый (5 шт/уп)</td><td>5</td><td>2050x3050</td><td>4 378.01</td></tr>
+        </table>
+        </body></html>
+        """
+        # Товар просит размер, которого в таблице вообще нет — не должны
+        # вернуть None, используем единственную строку с подходящей толщиной.
+        price = self.p.universal_table_parsing_bestly(html, "Лист ПВХ вспененный 3мм 9999x9999мм")
+        self.assertEqual(price, 1548.82)
+
     def test_parse_orgsteklo_table_improved(self):
         html = """
         <html><body>

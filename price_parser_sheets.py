@@ -1450,14 +1450,28 @@ class PriceParserWithSheets:
                         continue
                     
                     logger.info(f"Индекс колонки толщины: {thickness_col_idx}, цены: {price_col_idx}")
-                    
+
+                    # Индекс колонки с размером листа, если она есть. Нужна,
+                    # чтобы отличить строки с одинаковой толщиной, но разным
+                    # размером листа (например, 3мм 1220x2440 и 3мм 2050x3050
+                    # часто идут в одной таблице с разными ценами).
+                    size_col_idx = -1
+                    for i, header in enumerate(headers):
+                        if 'размер' in header:
+                            size_col_idx = i
+                            break
+
+                    fallback_price = None
+                    fallback_price_text = None
+                    fallback_thickness_text = None
+
                     # Теперь ищем строку с нужной толщиной
                     for row_idx, row in enumerate(rows[1:], 1):  # Пропускаем заголовок
                         cells = row.find_all(['td', 'th'])
-                        
+
                         if len(cells) <= max(thickness_col_idx, price_col_idx):
                             continue
-                        
+
                         # Получаем значение толщины из соответствующей колонки
                         thickness_cell = cells[thickness_col_idx]
                         thickness_text = thickness_cell.get_text(strip=True)
@@ -1467,25 +1481,56 @@ class PriceParserWithSheets:
                             thickness_text, thickness, mode='exact', tolerance=0.01
                         )
 
-                        if thickness_found:
-                            logger.info(f"Найдена строка с толщиной {thickness}мм: '{thickness_text}'")
-                            
-                            # Получаем цену из соответствующей колонки
-                            price_cell = cells[price_col_idx]
-                            price_text = price_cell.get_text(strip=True)
-                            price = self.extract_price_from_text(price_text)
-                            
-                            if price:
-                                logger.info(f"Цена из колонки цены: '{price_text}' -> {price}")
+                        if not thickness_found:
+                            continue
+
+                        logger.info(f"Найдена строка с толщиной {thickness}мм: '{thickness_text}'")
+
+                        # Получаем цену из соответствующей колонки
+                        price_cell = cells[price_col_idx]
+                        price_text = price_cell.get_text(strip=True)
+                        price = self.extract_price_from_text(price_text)
+
+                        if not price:
+                            # Если не нашли в колонке цены, пробуем найти цену во всей строке
+                            row_text = row.get_text(strip=True)
+                            price = self.extract_price_from_text(row_text)
+                            price_text = row_text
+
+                        if not price:
+                            continue
+
+                        # Если в названии товара указан конкретный размер листа
+                        # и в таблице есть колонка размера — несколько строк
+                        # могут совпадать по толщине, но иметь разный размер
+                        # (и, соответственно, разную цену). Берём строку, чей
+                        # размер реально совпадает с названием товара, а не
+                        # первую попавшуюся по толщине.
+                        if parameters.get('dimensions') and size_col_idx != -1 and len(cells) > size_col_idx:
+                            size_text = cells[size_col_idx].get_text(strip=True)
+                            row_dimensions = self.extract_dimensions_from_product_name(size_text)
+
+                            if row_dimensions == parameters['dimensions']:
+                                logger.info(f"Цена из колонки цены: '{price_text}' -> {price} (размер '{size_text}' совпал)")
                                 return price
-                            else:
-                                # Если не нашли в колонке цены, пробуем найти цену во всей строке
-                                row_text = row.get_text(strip=True)
-                                price = self.extract_price_from_text(row_text)
-                                if price:
-                                    logger.info(f"Цена из всей строки: {price}")
-                                    return price
-            
+
+                            if fallback_price is None:
+                                fallback_price = price
+                                fallback_price_text = price_text
+                                fallback_thickness_text = thickness_text
+                            continue
+
+                        logger.info(f"Цена из колонки цены: '{price_text}' -> {price}")
+                        return price
+
+                    if fallback_price is not None:
+                        logger.warning(
+                            f"Точное совпадение размера '{parameters.get('dimensions')}' не найдено среди строк "
+                            f"с толщиной {thickness}мм, используем первую подходящую по толщине строку "
+                            f"('{fallback_thickness_text}'): '{fallback_price_text}' -> {fallback_price}"
+                        )
+                        return fallback_price
+
             # Если не нашли через структуру таблицы, используем старый метод как запасной вариант
             logger.warning("Не удалось найти цену через структуру таблицы, используем альтернативный поиск...")
             return self.find_product_in_alternative_structures(html, product_name, parameters)
