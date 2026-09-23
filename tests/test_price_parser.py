@@ -1152,6 +1152,7 @@ class LedpremiumSiteTests(unittest.TestCase):
             p = make_parser_for_product(
                 tmpdir, "Светодиодная лента SIRIUS COB LP480 LH 24V", self.PRODUCT_URL, selector="",
             )
+            p.rounding_mode = 'ceil'  # тест про выбор селектора, а не про округление
             fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
             with patch.object(pps.requests, 'get', return_value=fake_response):
                 result = p.parse_single_product(0, p.df.iloc[0])
@@ -1165,6 +1166,7 @@ class LedpremiumSiteTests(unittest.TestCase):
                 tmpdir, "Светодиодная лента SIRIUS COB LP480 LH 24V", self.PRODUCT_URL,
                 selector='[itemprop="price"]',
             )
+            p.rounding_mode = 'ceil'  # тест про выбор селектора, а не про округление
             fake_response = make_fake_response(self.PRODUCT_URL, self.REAL_PRICE_HTML)
             with patch.object(pps.requests, 'get', return_value=fake_response):
                 result = p.parse_single_product(0, p.df.iloc[0])
@@ -1357,6 +1359,83 @@ class SelectorMissingDotAndScriptTagRegressionTests(unittest.TestCase):
 
         self.assertEqual(result['price'], 4750.0)
         self.assertNotIn(result['price'], (4223.0, 10800.0))
+
+
+class DefaultRoundingModeTests(unittest.TestCase):
+    """
+    Every real parsing report shared across this project's history showed
+    'no_decimal' (round up to a whole ruble) as the active mode — the
+    user was manually re-selecting it every single run, since it was
+    never actually the coded default ('ceil', which only rounds to the
+    nearest kopeck and rarely changes anything for a materials price
+    list). Made 'no_decimal' the real default so this no longer needs
+    reselecting each session.
+    """
+
+    def test_new_parser_defaults_to_no_decimal(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector="")
+        self.assertEqual(p.rounding_mode, 'no_decimal')
+
+    def test_default_rounds_a_fractional_price_up_to_a_whole_ruble(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector="")
+        # no_decimal всегда округляет вверх, а не к ближайшему целому
+        self.assertEqual(p.round_price(722.01), 723)
+        self.assertEqual(p.round_price(722.99), 723)
+
+
+class MenuCancelOptionTests(unittest.TestCase):
+    """
+    Every interactive menu item that asks for input should let the user
+    back out with an empty Enter (or an explicit "нет") instead of forcing
+    them to answer or Ctrl+C out. These check that the cancel path prints
+    "Отмена", returns without crashing, and — most importantly — never
+    reaches the network/Excel-writing code that follows the prompt.
+    """
+
+    def test_save_selectors_to_excel_cancel_does_not_touch_the_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector=".price")
+            mtime_before = os.path.getmtime(p.excel_file)
+            with patch('builtins.input', side_effect=["нет"]):
+                p.save_selectors_to_excel()
+            self.assertEqual(os.path.getmtime(p.excel_file), mtime_before)
+
+    def test_save_selectors_to_excel_empty_input_also_cancels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector=".price")
+            mtime_before = os.path.getmtime(p.excel_file)
+            with patch('builtins.input', side_effect=[""]):
+                p.save_selectors_to_excel()
+            self.assertEqual(os.path.getmtime(p.excel_file), mtime_before)
+
+    def test_find_and_select_selector_for_product_empty_input_cancels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector="")
+            with patch('builtins.input', side_effect=[""]), \
+                 patch.object(pps.PriceParserWithSheets, 'get_with_requests') as mock_get:
+                p.find_and_select_selector_for_product()
+            mock_get.assert_not_called()
+
+    def test_test_selector_for_product_empty_input_cancels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(tmpdir, "Товар", "https://example.com/x/", selector=".price")
+            with patch('builtins.input', side_effect=[""]), \
+                 patch.object(pps.PriceParserWithSheets, 'get_with_requests') as mock_get:
+                p.test_selector_for_product()
+            mock_get.assert_not_called()
+
+    def test_test_universal_parser_empty_input_cancels(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = make_parser_for_product(
+                tmpdir, "Товар с bestly.ru", "https://bestly.ru/catalog/gazon.html", selector=""
+            )
+            with patch('builtins.input', side_effect=[""]), \
+                 patch.object(pps.PriceParserWithSheets, 'get_with_requests') as mock_get, \
+                 no_selenium():
+                p.test_universal_parser()
+            mock_get.assert_not_called()
 
 
 if __name__ == '__main__':
