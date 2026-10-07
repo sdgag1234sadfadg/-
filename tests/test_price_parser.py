@@ -15,6 +15,7 @@ Selenium и webdriver_manager не обязательны для запуска 
     python -m unittest discover -s tests
 """
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -120,6 +121,25 @@ class SafeStrTests(unittest.TestCase):
     def test_regular_value(self):
         self.assertEqual(pps.safe_str('hello'), 'hello')
         self.assertEqual(pps.safe_str(123), '123')
+
+
+class SafeFloatTests(unittest.TestCase):
+    def test_none_and_nan_return_default(self):
+        self.assertIsNone(pps.safe_float(None))
+        self.assertIsNone(pps.safe_float(float('nan')))
+        self.assertEqual(pps.safe_float(None, default=0), 0)
+
+    def test_numeric_passthrough(self):
+        self.assertEqual(pps.safe_float(123), 123.0)
+        self.assertEqual(pps.safe_float(45.67), 45.67)
+
+    def test_string_with_thousands_separator_and_comma(self):
+        self.assertEqual(pps.safe_float("1 234,56"), 1234.56)
+        self.assertEqual(pps.safe_float("1234.56"), 1234.56)
+
+    def test_empty_and_garbage_string_return_default(self):
+        self.assertIsNone(pps.safe_float(""))
+        self.assertIsNone(pps.safe_float("не число"))
 
 
 class ExtractPriceFromTextTests(unittest.TestCase):
@@ -1472,6 +1492,199 @@ class MenuCancelOptionTests(unittest.TestCase):
                  no_selenium():
                 p.test_universal_parser()
             mock_get.assert_not_called()
+
+
+class SeleniumDriverReuseTests(unittest.TestCase):
+    """
+    Regression test: parse_all_products() used to fully close and
+    re-initialize the Selenium driver before EVERY bestly.ru product (to
+    avoid "cache buildup"), which added several seconds of webdriver
+    startup overhead per product. get_with_selenium() already clears
+    cookies/localStorage/sessionStorage before each bestly.ru page load, so
+    the driver can now be reused across consecutive bestly.ru products and
+    is only closed once, at the end of the whole run.
+    """
+
+    TABLE_HTML = """
+    <html><body>
+    <table>
+    <tr><th>Толщина, мм</th><th>Цена Р/л.</th></tr>
+    <tr><td>3</td><td>1 500.00</td></tr>
+    <tr><td>5</td><td>2 500.00</td></tr>
+    </table>
+    </body></html>
+    """
+
+    def test_driver_is_not_closed_between_consecutive_bestly_products(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = os.path.join(tmpdir, "test.xlsx")
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Прайс-лист"
+            ws.append(["Название", "URL", "Цена", "Селектор", "Характеристика", "Дата обновления"])
+            ws.append(["Лист ПВХ 3мм", "https://bestly.ru/catalog/pvc3.html", "", "", "", ""])
+            ws.append(["Лист ПВХ 5мм", "https://bestly.ru/catalog/pvc5.html", "", "", "", ""])
+            wb.save(xlsx_path)
+
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with patch.object(pps.PriceParserWithSheets, 'get_with_selenium',
+                                   return_value=self.TABLE_HTML) as mock_selenium, \
+                     patch.object(pps.PriceParserWithSheets, 'close_selenium_driver') as mock_close, \
+                     patch.object(pps.time, 'sleep', return_value=None):
+                    ok = p.parse_all_products()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertTrue(ok)
+        self.assertEqual(mock_selenium.call_count, 2)
+        # Раньше драйвер закрывался перед КАЖДЫМ bestly.ru товаром в цикле
+        # (итого 1 раз для 2-го товара) плюс ещё раз в finally — 2 вызова на
+        # 2 товара. Теперь закрытие происходит только один раз, в конце.
+        self.assertEqual(mock_close.call_count, 1)
+
+
+class PriceChangeAnomalyTests(unittest.TestCase):
+    """
+    detect_price_change_anomaly() flags a new price that differs from the
+    previous one by 2x or more in either direction — the same shape every
+    real parser bug reported in this project took (wrong sheet size, wrong
+    product variant, wrong row in a table).
+    """
+
+    def setUp(self):
+        self.p = make_parser()
+
+    def test_price_doubling_is_flagged(self):
+        warning = self.p.detect_price_change_anomaly(1500, 3000)
+        self.assertIsNotNone(warning)
+        self.assertIn("выросла", warning)
+
+    def test_price_halving_is_flagged(self):
+        warning = self.p.detect_price_change_anomaly(3000, 1500)
+        self.assertIsNotNone(warning)
+        self.assertIn("упала", warning)
+
+    def test_moderate_change_is_not_flagged(self):
+        self.assertIsNone(self.p.detect_price_change_anomaly(1500, 1650))  # +10%
+        self.assertIsNone(self.p.detect_price_change_anomaly(1500, 1000))  # -33%
+
+    def test_missing_or_non_positive_values_are_ignored(self):
+        self.assertIsNone(self.p.detect_price_change_anomaly(None, 3000))
+        self.assertIsNone(self.p.detect_price_change_anomaly(1500, None))
+        self.assertIsNone(self.p.detect_price_change_anomaly(0, 3000))
+        self.assertIsNone(self.p.detect_price_change_anomaly(1500, 0))
+
+
+class PriceChangeAnomalyIntegrationTests(unittest.TestCase):
+    """
+    End-to-end: parse_all_products() must surface a price_change_warning on
+    the result dict when a product's new price jumps implausibly compared
+    to what was already in the Excel file, without blocking the save.
+    """
+
+    def test_suspicious_jump_is_recorded_on_the_result(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = os.path.join(tmpdir, "test.xlsx")
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Прайс-лист"
+            ws.append(["Название", "URL", "Цена", "Селектор", "Характеристика", "Дата обновления"])
+            ws.append(["Товар", "https://example.com/x/", "1500", ".price", "", ""])
+            wb.save(xlsx_path)
+
+            p = pps.PriceParserWithSheets(xlsx_path, sheet_name="Прайс-лист")
+
+            html = "<html><body><div class='price'>4500</div></body></html>"
+
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                with patch.object(pps.requests, 'get',
+                                   return_value=make_fake_response("https://example.com/x/", html)):
+                    ok = p.parse_all_products()
+            finally:
+                os.chdir(old_cwd)
+
+        self.assertTrue(ok)
+        self.assertEqual(len(p.results), 1)
+        self.assertEqual(p.results[0]['price'], 4500.0)
+        self.assertIsNotNone(p.results[0].get('price_change_warning'))
+        self.assertIn("выросла", p.results[0]['price_change_warning'])
+
+
+class SiteConfigsFileTests(unittest.TestCase):
+    """
+    site_configs used to be a dict literal baked into __init__ — adding or
+    fixing a site's selectors meant editing Python. It's now loaded from
+    SITE_CONFIGS_FILE (site_configs.json) when present, falling back to the
+    built-in DEFAULT_SITE_CONFIGS otherwise, so selectors can be edited
+    without touching code. Loading must never write to the working
+    directory by itself (that would pollute cwd on every parser
+    construction, including in tests) — only an explicit
+    ensure_site_configs_file() call creates the file.
+    """
+
+    def setUp(self):
+        self._old_cwd = os.getcwd()
+        self._tmpdir = tempfile.mkdtemp()
+        os.chdir(self._tmpdir)
+
+    def tearDown(self):
+        os.chdir(self._old_cwd)
+
+    def test_missing_file_uses_builtin_defaults_without_creating_it(self):
+        p = make_parser_for_product(self._tmpdir, "Товар", "https://example.com/x/", selector="")
+        self.assertEqual(p.site_configs, pps.DEFAULT_SITE_CONFIGS)
+        self.assertFalse(os.path.exists(pps.SITE_CONFIGS_FILE))
+
+    def test_existing_file_overrides_defaults(self):
+        custom_configs = {
+            "example.com": {
+                "name": "Тестовый сайт",
+                "method": "requests",
+                "price_selectors": [".my-custom-price"],
+            }
+        }
+        with open(pps.SITE_CONFIGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(custom_configs, f, ensure_ascii=False)
+
+        p = make_parser_for_product(self._tmpdir, "Товар", "https://example.com/x/", selector="")
+        self.assertEqual(p.site_configs, custom_configs)
+        self.assertNotIn('bestly.ru', p.site_configs)
+
+    def test_corrupted_file_falls_back_to_defaults(self):
+        with open(pps.SITE_CONFIGS_FILE, 'w', encoding='utf-8') as f:
+            f.write("{ не валидный json")
+
+        p = make_parser_for_product(self._tmpdir, "Товар", "https://example.com/x/", selector="")
+        self.assertEqual(p.site_configs, pps.DEFAULT_SITE_CONFIGS)
+
+    def test_ensure_site_configs_file_creates_it_with_defaults(self):
+        p = make_parser_for_product(self._tmpdir, "Товар", "https://example.com/x/", selector="")
+        self.assertFalse(os.path.exists(pps.SITE_CONFIGS_FILE))
+
+        p.ensure_site_configs_file()
+
+        self.assertTrue(os.path.exists(pps.SITE_CONFIGS_FILE))
+        with open(pps.SITE_CONFIGS_FILE, 'r', encoding='utf-8') as f:
+            written = json.load(f)
+        self.assertEqual(written, pps.DEFAULT_SITE_CONFIGS)
+
+    def test_ensure_site_configs_file_does_not_overwrite_existing_edits(self):
+        custom_configs = {"example.com": {"name": "X", "method": "requests"}}
+        with open(pps.SITE_CONFIGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(custom_configs, f, ensure_ascii=False)
+
+        p = make_parser_for_product(self._tmpdir, "Товар", "https://example.com/x/", selector="")
+        p.ensure_site_configs_file()
+
+        with open(pps.SITE_CONFIGS_FILE, 'r', encoding='utf-8') as f:
+            still_there = json.load(f)
+        self.assertEqual(still_there, custom_configs)
 
 
 if __name__ == '__main__':

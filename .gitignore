@@ -2,4 +2,5 @@ __pycache__/
 *.pyc
 price_parser.log
 user_selections.json
+site_configs.json
 *.xlsx
