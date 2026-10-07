@@ -1687,5 +1687,64 @@ class SiteConfigsFileTests(unittest.TestCase):
         self.assertEqual(still_there, custom_configs)
 
 
+class CliArgsTests(unittest.TestCase):
+    """
+    The Excel file path and sheet name used to be hardcoded in main(),
+    which blocked colleagues with a differently-named price list from
+    running the script without editing code. parse_cli_args() now accepts
+    --file/--sheet, and resolve_excel_file() falls back to an interactive
+    prompt when no usable file is found.
+    """
+
+    def test_defaults_when_no_args_given(self):
+        args = pps.parse_cli_args([])
+        self.assertIsNone(args.excel_file)
+        self.assertEqual(args.sheet_name, pps.DEFAULT_SHEET_NAME)
+
+    def test_explicit_file_and_sheet_args(self):
+        args = pps.parse_cli_args(['--file', 'my_prices.xlsx', '--sheet', 'Прайс'])
+        self.assertEqual(args.excel_file, 'my_prices.xlsx')
+        self.assertEqual(args.sheet_name, 'Прайс')
+
+    def test_short_flags(self):
+        args = pps.parse_cli_args(['-f', 'my_prices.xlsx', '-s', 'Прайс'])
+        self.assertEqual(args.excel_file, 'my_prices.xlsx')
+        self.assertEqual(args.sheet_name, 'Прайс')
+
+
+class ResolveExcelFileTests(unittest.TestCase):
+    def test_existing_cli_value_is_used_as_is(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            xlsx_path = os.path.join(tmpdir, "my_prices.xlsx")
+            Workbook().save(xlsx_path)
+
+            result = pps.resolve_excel_file(xlsx_path, input_fn=lambda prompt: self.fail("should not prompt"))
+        self.assertEqual(result, xlsx_path)
+
+    def test_missing_cli_value_falls_back_to_interactive_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                real_path = os.path.join(tmpdir, "real_prices.xlsx")
+                Workbook().save(real_path)
+                result = pps.resolve_excel_file("nonexistent.xlsx", input_fn=lambda prompt: real_path)
+            finally:
+                os.chdir(old_cwd)
+        self.assertEqual(result, real_path)
+
+    def test_empty_input_cancels(self):
+        result = pps.resolve_excel_file("definitely_missing.xlsx", input_fn=lambda prompt: "")
+        self.assertIsNone(result)
+
+    def test_reprompts_until_a_valid_path_is_given(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_path = os.path.join(tmpdir, "real_prices.xlsx")
+            Workbook().save(real_path)
+            responses = iter(["still_missing.xlsx", real_path])
+            result = pps.resolve_excel_file("definitely_missing.xlsx", input_fn=lambda prompt: next(responses))
+        self.assertEqual(result, real_path)
+
+
 if __name__ == '__main__':
     unittest.main()

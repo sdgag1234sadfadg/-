@@ -12,6 +12,7 @@ import json
 import copy
 import hashlib
 import traceback
+import argparse
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -156,6 +157,14 @@ ERROR_PAGE_MARKERS = (
 # сайтов (см. load_site_configs). Хранится в рабочей директории — рядом с
 # user_selections.json и price_parser.log.
 SITE_CONFIGS_FILE = 'site_configs.json'
+
+# Имя Excel-файла и листа по умолчанию — используются, если путь не
+# передан аргументом командной строки (--file/--sheet, см. parse_cli_args
+# и resolve_excel_file). У коллег с другим прайс-листом свой файл можно
+# либо передать аргументом, либо ввести при запуске — редактировать код
+# для этого не нужно.
+DEFAULT_EXCEL_FILE = "Цены на материалы(автоматические).xlsx"
+DEFAULT_SHEET_NAME = "Прайс-лист"
 
 # Настройки парсинга по сайтам (метод получения страницы, заголовки
 # запроса, селекторы цены) — встроенные значения по умолчанию. При первом
@@ -4690,8 +4699,59 @@ class PriceParserWithSheets:
             traceback.print_exc()
 
 
+def parse_cli_args(argv=None):
+    """
+    Разбирает аргументы командной строки запуска скрипта.
+
+    Вынесено в отдельную функцию (а не inline в main()), чтобы разбор
+    аргументов можно было протестировать без запуска интерактивного меню.
+    """
+    arg_parser = argparse.ArgumentParser(
+        description="Парсер цен для Excel-файла прайс-листа"
+    )
+    arg_parser.add_argument(
+        '--file', '-f', dest='excel_file', default=None,
+        help=f"Путь к Excel-файлу прайс-листа (по умолчанию: {DEFAULT_EXCEL_FILE})"
+    )
+    arg_parser.add_argument(
+        '--sheet', '-s', dest='sheet_name', default=DEFAULT_SHEET_NAME,
+        help=f"Имя листа с товарами (по умолчанию: {DEFAULT_SHEET_NAME})"
+    )
+    return arg_parser.parse_args(argv)
+
+
+def resolve_excel_file(cli_value, input_fn=input):
+    """
+    Определяет путь к Excel-файлу прайс-листа.
+
+    Если файл передан аргументом командной строки (или совпадает с именем
+    по умолчанию) и существует — используется он. Иначе путь запрашивается
+    интерактивно (с возможностью отменить пустым Enter) — так коллеги с
+    другим именем прайс-листа могут запустить скрипт, не трогая код: либо
+    передать свой файл аргументом --file, либо просто ввести путь при
+    запуске.
+    """
+    candidate = cli_value or DEFAULT_EXCEL_FILE
+    if os.path.exists(candidate):
+        return candidate
+
+    print(f"Файл '{candidate}' не найден.")
+    while True:
+        entered = input_fn("Введите путь к вашему Excel-файлу прайс-листа (Enter — отмена): ").strip()
+        if not entered:
+            print("Отмена")
+            return None
+        if os.path.exists(entered):
+            return entered
+        print(f"Файл '{entered}' не найден, попробуйте снова.")
+
+
 def main():
     """Основная функция"""
+    # Разбираем аргументы командной строки до вывода баннера — иначе
+    # --help сначала печатал бы весь баннер меню и только потом помощь.
+    args = parse_cli_args()
+
     print("="*60)
     print("ПАРСЕР ЦЕН ДЛЯ EXCEL ФАЙЛА")
     print("="*60)
@@ -4707,14 +4767,13 @@ def main():
     print("7. Предупреждение о подозрительном изменении цены (вдвое и сильнее)")
     print(f"8. Селекторы и настройки сайтов — в {SITE_CONFIGS_FILE}, редактируются без правки кода")
     print("="*60)
-    
-    excel_file = "Цены на материалы(автоматические).xlsx"
-    sheet_name = "Прайс-лист"
-    
-    if not os.path.exists(excel_file):
-        print(f"Файл {excel_file} не найден!")
+
+    excel_file = resolve_excel_file(args.excel_file)
+    sheet_name = args.sheet_name
+
+    if not excel_file:
         return
-    
+
     parser = PriceParserWithSheets(excel_file, sheet_name)
     parser.ensure_site_configs_file()
 
