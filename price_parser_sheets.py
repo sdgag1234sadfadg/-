@@ -9,6 +9,7 @@ import os
 import re
 import math
 import json
+import copy
 import hashlib
 import traceback
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urljoin
@@ -151,6 +152,122 @@ ERROR_PAGE_MARKERS = (
     'ошибка 404', '404 not found',
 )
 
+# Имя файла, в который выгружается и из которого читается конфигурация
+# сайтов (см. load_site_configs). Хранится в рабочей директории — рядом с
+# user_selections.json и price_parser.log.
+SITE_CONFIGS_FILE = 'site_configs.json'
+
+# Настройки парсинга по сайтам (метод получения страницы, заголовки
+# запроса, селекторы цены) — встроенные значения по умолчанию. При первом
+# запуске выгружаются в SITE_CONFIGS_FILE, и дальше селекторы/сайты можно
+# добавлять и править прямо в этом JSON-файле, без правки кода (см.
+# load_site_configs). Эта константа — тот набор, с которого можно начать
+# заново, если файл повреждён или удалён.
+DEFAULT_SITE_CONFIGS = {
+    'expo-torg.ru': {
+        'name': 'Экспо-Торг',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        'price_selectors': [
+            '.product-item-detail-price-current',
+        ]
+    },
+    'bestly.ru': {
+        'name': 'Bestly',
+        'method': 'selenium',  # Используем Selenium для Bestly
+        'selenium_wait': 20,  # Увеличенное время ожидания для Bestly
+        'dynamic_content': True,  # Указываем, что контент динамический
+        'use_selenium_context_search': True,  # Использовать контекстный поиск через Selenium
+        'price_selectors': [
+            '.item_price',  # Основной селектор для bestly.ru из данных
+            '.price', '.product-price', '.woocommerce-Price-amount',
+            '.product-item-price', '.regular-price', '.current-price',
+            '.product-card__price', '.catalog-item-price',
+            'span.price', 'div.price', 'p.price',
+            '[data-price]', '[itemprop="price"]',
+            '.product-card-price', '.item-price', '.price-value',
+            '.product_price', '.card-price', '.catalog-price',
+            '.js-product-price', '.product__price', '.price__current',
+            '.product-price-current', '.product-price__value',
+            '.price-value', '.price-new', '.price-old',
+            '.b-product-price__current',  # Новые селекторы для Bestly
+            '.product-card__price-current',
+            '.price_item', '.price-block',
+            'div[class*="price"]', 'span[class*="price"]',
+            '.price-replace-bottom'  # Добавляем специфичный селектор для Bestly
+        ],
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        'card_selectors': [  # Селекторы для карточек товаров
+            '.catalog-item', '.product-item', '.item',
+            'div[class*="item"]', 'div[class*="product"]',
+            '.catalog-section', '.product-card', '.goods-item'
+        ],
+        'special_parsers': {  # Специальные парсеры для определенных страниц
+            'org_steklo_plazcryl': 'parse_orgsteklo_table'
+        }
+    },
+    'donalum.ru': {
+        'name': 'Доналюм',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    },
+    'expocomplete.ru': {
+        'name': 'ExpoComplete',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+    },
+    'msk.standart.pro': {
+        'name': 'Стандарт',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        'price_selectors': [
+            '.product-item-detail-price-current',
+        ]
+    },
+    'ledpremium.ru': {
+        'name': 'ЛедПремиум',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        'price_selectors': [
+            '[itemprop="price"]',
+            '.item_price',
+        ]
+    },
+    'ros-met.com': {
+        'name': 'РосМет',
+        'method': 'requests',
+        'headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        },
+        # Сайт на WooCommerce — стандартная разметка цены этого плагина
+        'price_selectors': [
+            '.woocommerce-Price-amount',
+        ]
+    }
+}
+
 
 def strip_tracking_params(url):
     """
@@ -193,6 +310,25 @@ def safe_str(value, default=''):
         return default
 
 
+def safe_float(value, default=None):
+    """
+    Безопасное преобразование значения ячейки Excel в float.
+    Обрабатывает None, NaN, числа и строки вида "1 234,56" / "1234.56".
+    """
+    try:
+        if value is None or pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        cleaned = str(value).strip().replace('\xa0', '').replace(' ', '').replace(',', '.')
+        return float(cleaned) if cleaned else default
+    except (TypeError, ValueError):
+        return default
+
+
 class PriceParserWithSheets:
     def __init__(self, excel_file_path, sheet_name="Прайс-лист"):
         """
@@ -219,112 +355,55 @@ class PriceParserWithSheets:
         # Загружаем сохраненные выборы пользователя при инициализации
         self.load_user_selections()
         
-        # Улучшенная конфигурация для разных сайтов
-        self.site_configs = {
-            'expo-torg.ru': {
-                'name': 'Экспо-Торг',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                'price_selectors': [
-                    '.product-item-detail-price-current',
-                ]
-            },
-            'bestly.ru': {
-                'name': 'Bestly',
-                'method': 'selenium',  # Используем Selenium для Bestly
-                'selenium_wait': 20,  # Увеличенное время ожидания для Bestly
-                'dynamic_content': True,  # Указываем, что контент динамический
-                'use_selenium_context_search': True,  # Использовать контекстный поиск через Selenium
-                'price_selectors': [
-                    '.item_price',  # Основной селектор для bestly.ru из данных
-                    '.price', '.product-price', '.woocommerce-Price-amount',
-                    '.product-item-price', '.regular-price', '.current-price',
-                    '.product-card__price', '.catalog-item-price',
-                    'span.price', 'div.price', 'p.price',
-                    '[data-price]', '[itemprop="price"]',
-                    '.product-card-price', '.item-price', '.price-value',
-                    '.product_price', '.card-price', '.catalog-price',
-                    '.js-product-price', '.product__price', '.price__current',
-                    '.product-price-current', '.product-price__value',
-                    '.price-value', '.price-new', '.price-old',
-                    '.b-product-price__current',  # Новые селекторы для Bestly
-                    '.product-card__price-current',
-                    '.price_item', '.price-block',
-                    'div[class*="price"]', 'span[class*="price"]',
-                    '.price-replace-bottom'  # Добавляем специфичный селектор для Bestly
-                ],
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                'card_selectors': [  # Селекторы для карточек товаров
-                    '.catalog-item', '.product-item', '.item', 
-                    'div[class*="item"]', 'div[class*="product"]',
-                    '.catalog-section', '.product-card', '.goods-item'
-                ],
-                'special_parsers': {  # Специальные парсеры для определенных страниц
-                    'org_steklo_plazcryl': 'parse_orgsteklo_table'
-                }
-            },
-            'donalum.ru': {
-                'name': 'Доналюм',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-            },
-            'expocomplete.ru': {
-                'name': 'ExpoComplete',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-            },
-            'msk.standart.pro': {
-                'name': 'Стандарт',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                'price_selectors': [
-                    '.product-item-detail-price-current',
-                ]
-            },
-            'ledpremium.ru': {
-                'name': 'ЛедПремиум',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                'price_selectors': [
-                    '[itemprop="price"]',
-                    '.item_price',
-                ]
-            },
-            'ros-met.com': {
-                'name': 'РосМет',
-                'method': 'requests',
-                'headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                },
-                # Сайт на WooCommerce — стандартная разметка цены этого плагина
-                'price_selectors': [
-                    '.woocommerce-Price-amount',
-                ]
-            }
-        }
-    
+        # Конфигурация сайтов (метод получения страницы, заголовки,
+        # селекторы цены) — читается из SITE_CONFIGS_FILE, чтобы сайты и
+        # селекторы можно было добавлять/править прямо в JSON, без правки
+        # кода (см. load_site_configs и DEFAULT_SITE_CONFIGS).
+        self.site_configs = self.load_site_configs()
+
+    def load_site_configs(self):
+        """
+        Загружает конфигурацию сайтов из SITE_CONFIGS_FILE, если он есть —
+        так сайты и селекторы цены можно редактировать прямо в этом JSON,
+        без правки кода. Если файла нет или он повреждён, используются
+        встроенные настройки по умолчанию (DEFAULT_SITE_CONFIGS); сам файл
+        при этом не создаётся — см. ensure_site_configs_file(), которую
+        вызывает main() при обычном запуске скрипта.
+        """
+        if not os.path.exists(SITE_CONFIGS_FILE):
+            return copy.deepcopy(DEFAULT_SITE_CONFIGS)
+
+        try:
+            with open(SITE_CONFIGS_FILE, 'r', encoding='utf-8') as f:
+                configs = json.load(f)
+            logger.info(f"Загружена конфигурация {len(configs)} сайтов из {SITE_CONFIGS_FILE}")
+            return configs
+        except Exception as e:
+            logger.error(
+                f"Не удалось загрузить {SITE_CONFIGS_FILE}, используются встроенные настройки: {e}"
+            )
+            return copy.deepcopy(DEFAULT_SITE_CONFIGS)
+
+    def ensure_site_configs_file(self):
+        """
+        Создаёт SITE_CONFIGS_FILE со встроенными настройками по умолчанию,
+        если его ещё нет — чтобы было с чего начать редактирование
+        селекторов. Вызывается явно из main(), а не из __init__/
+        load_site_configs, чтобы создание парсера в тестах не писало файлы
+        в рабочую директорию.
+        """
+        if os.path.exists(SITE_CONFIGS_FILE):
+            return
+        try:
+            with open(SITE_CONFIGS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(DEFAULT_SITE_CONFIGS, f, ensure_ascii=False, indent=2)
+            logger.info(
+                f"Создан файл {SITE_CONFIGS_FILE} со стандартными настройками сайтов — "
+                "селекторы и сайты можно редактировать прямо в нём"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось создать {SITE_CONFIGS_FILE}: {e}")
+
     def load_user_selections(self):
         """Загрузка сохраненных выборов пользователя из файла"""
         try:
@@ -2897,11 +2976,17 @@ class PriceParserWithSheets:
             # Устанавливаем таймаут загрузки страницы
             self.driver.set_page_load_timeout(120)  # Увеличиваем таймаут для Bestly
             
-            # Для bestly.ru очищаем cookies и кэш перед загрузкой
+            # Для bestly.ru очищаем cookies и локальное хранилище перед
+            # загрузкой — это даёт тот же эффект "чистого" состояния, что и
+            # полный перезапуск драйвера, но без накладных расходов на
+            # пересоздание webdriver на каждый товар.
             if 'bestly.ru' in url:
                 try:
                     self.driver.delete_all_cookies()
-                    logger.info("Cookies очищены для Bestly")
+                    self.driver.execute_script(
+                        "window.localStorage.clear(); window.sessionStorage.clear();"
+                    )
+                    logger.info("Cookies и localStorage/sessionStorage очищены для Bestly")
                 except Exception:
                     pass
             
@@ -3985,7 +4070,38 @@ class PriceParserWithSheets:
         print(f"Статус: {result['status']}")
         print(f"Время: {result['timestamp']}")
         print(f"{'='*60}")
-    
+
+    def detect_price_change_anomaly(self, old_price, new_price, ratio_threshold=2.0):
+        """
+        Возвращает текст предупреждения, если новая цена отличается от
+        старой (сохранённой в Excel до этого запуска) подозрительно сильно
+        — в ratio_threshold раз и более в любую сторону, иначе None.
+
+        Это не доказательство ошибки само по себе — цены на материалы
+        иногда действительно так меняются — но именно так выглядели
+        реальные баги парсера (взята цена другого размера листа, другого
+        варианта товара и т.п.), поэтому такие случаи стоит перепроверить
+        вручную перед тем, как доверять прайс-листу.
+        """
+        if old_price is None or new_price is None:
+            return None
+        if old_price <= 0 or new_price <= 0:
+            return None
+
+        ratio = new_price / old_price
+        if ratio >= ratio_threshold:
+            return (
+                f"цена выросла в {ratio:.1f} раза (было {old_price:g}, стало {new_price:g}) — "
+                f"проверьте вручную, не взята ли цена другого товара/варианта"
+            )
+        if ratio <= 1 / ratio_threshold:
+            drop_ratio = old_price / new_price
+            return (
+                f"цена упала в {drop_ratio:.1f} раза (было {old_price:g}, стало {new_price:g}) — "
+                f"проверьте вручную, не взята ли цена другого товара/варианта"
+            )
+        return None
+
     def parse_all_products(self, start_from=0, limit=None):
         """Парсинг всех товаров"""
         if not self.load_excel_data():
@@ -4036,33 +4152,53 @@ class PriceParserWithSheets:
                     user_selection_used += 1
                     logger.info(f"Используем сохраненный выбор пользователя для товара {idx+1}")
                 
-                # Закрываем драйвер перед каждым bestly.ru, чтобы избежать накопления кэша
-                if 'bestly.ru' in domain and self.driver:
-                    self.close_selenium_driver()
+                # Раньше здесь драйвер Selenium полностью пересоздавался перед
+                # каждым товаром bestly.ru (чтобы избежать накопления кэша),
+                # что добавляло ~5-10 секунд на инициализацию webdriver на
+                # КАЖДЫЙ такой товар. get_with_selenium() уже чистит cookies
+                # и localStorage/sessionStorage перед каждой загрузкой bestly.ru
+                # — этого достаточно, а сам драйвер переиспользуется между
+                # товарами и закрывается один раз в конце парсинга (см. finally).
+                if 'bestly.ru' in domain:
                     bestly_count += 1
                 elif domain:
                     other_count += 1
                 
                 # Парсим товар
+                old_price = safe_float(row.get('Цена'))
                 result = self.parse_single_product(idx, row)
+
+                # Проверяем, не похожа ли новая цена на ошибку парсера (взята
+                # цена другого товара/варианта/размера) — именно так выглядели
+                # реальные баги вроде "не тот размер листа" или "везде одна
+                # и та же цена". Не блокирует сохранение, только предупреждает.
+                anomaly = self.detect_price_change_anomaly(old_price, result.get('price'))
+                if anomaly:
+                    result['price_change_warning'] = anomaly
+                    logger.warning(f"Товар #{idx+1} ({result.get('name', '')}): {anomaly}")
+                    print(f"⚠ Товар #{idx+1}: {anomaly}")
+
                 self.results.append(result)
-                
+
                 # Считаем использование нового парсера таблиц
                 if 'bestly_table_parser' in result.get('status', ''):
                     table_parser_used += 1
-                
+
                 # Задержка между запросами (разная для разных сайтов)
                 if idx < end_idx - 1:
                     if 'bestly.ru' in domain:
                         time.sleep(8)  # Большая задержка для Bestly
                     else:
                         time.sleep(3)  # Стандартная задержка
-            
+
             print("\nСтатистика по типам сайтов:")
             print(f"  Bestly.ru: {bestly_count} товаров")
             print(f"  Другие сайты: {other_count} товаров")
             print(f"  Использовано сохраненных выборов: {user_selection_used}")
             print(f"  Использован новый парсер таблиц: {table_parser_used}")
+            suspicious_count = sum(1 for r in self.results if r.get('price_change_warning'))
+            if suspicious_count:
+                print(f"  ⚠ Подозрительных изменений цены: {suspicious_count} (см. отчёт)")
             
             # Сохраняем результаты
             self.save_results_to_excel()
@@ -4374,11 +4510,23 @@ class PriceParserWithSheets:
                 if user_selection_used > 0:
                     f.write("СОХРАНЕННЫЕ ВЫБОРЫ ПОЛЬЗОВАТЕЛЯ:\n")
                     f.write(f"  Использовано: {user_selection_used}\n\n")
-                
+
+                # Подозрительные изменения цены (см. detect_price_change_anomaly):
+                # вынесены отдельным блоком в начало отчёта, чтобы не искать их
+                # среди десятков обычных результатов вручную.
+                suspicious_results = [r for r in self.results if r.get('price_change_warning')]
+                if suspicious_results:
+                    f.write(f"{'='*70}\n")
+                    f.write(f"⚠ ПОДОЗРИТЕЛЬНЫЕ ИЗМЕНЕНИЯ ЦЕНЫ ({len(suspicious_results)}):\n")
+                    f.write(f"{'='*70}\n")
+                    for result in suspicious_results:
+                        f.write(f"  Товар #{result['index'] + 1} ({result['name']}): {result['price_change_warning']}\n")
+                    f.write("\n")
+
                 f.write(f"{'='*70}\n")
                 f.write("ДЕТАЛЬНЫЕ РЕЗУЛЬТАТЫ:\n")
                 f.write(f"{'='*70}\n\n")
-                
+
                 for result in self.results:
                     f.write(f"ТОВАР #{result['index'] + 1}:\n")
                     f.write(f"  Название: {result['name']}\n")
@@ -4389,9 +4537,11 @@ class PriceParserWithSheets:
                     f.write(f"  Найденный селектор: {result.get('best_found_selector', 'Не найден')}\n")
                     f.write(f"  Режим округления: {result.get('rounding_mode', 'ceil')}\n")
                     f.write(f"  Статус: {result['status']}\n")
+                    if result.get('price_change_warning'):
+                        f.write(f"  ⚠ Предупреждение: {result['price_change_warning']}\n")
                     f.write(f"  Время: {result['timestamp']}\n")
                     f.write("-" * 50 + "\n\n")
-            
+
             print(f"\n{'='*60}")
             print("ОТЧЕТ СОЗДАН:")
             print(f"  Файл: {report_file}")
@@ -4401,6 +4551,8 @@ class PriceParserWithSheets:
             print(f"  Режим округления: {self.rounding_mode}")
             print("  Новый парсер таблицы оргстекла: ВКЛЮЧЕН")
             print(f"  Использовано сохраненных выборов: {len(self.user_selections)}")
+            if suspicious_results:
+                print(f"  ⚠ Подозрительных изменений цены: {len(suspicious_results)} (см. отчёт)")
             print(f"{'='*60}")
             
         except Exception as e:
@@ -4552,6 +4704,8 @@ def main():
     print("4. Интеллектуальный поиск по соответствию параметров")
     print("5. Альтернативный поиск в карточках и списках товаров")
     print("6. Проверка разумности цен")
+    print("7. Предупреждение о подозрительном изменении цены (вдвое и сильнее)")
+    print(f"8. Селекторы и настройки сайтов — в {SITE_CONFIGS_FILE}, редактируются без правки кода")
     print("="*60)
     
     excel_file = "Цены на материалы(автоматические).xlsx"
@@ -4562,7 +4716,8 @@ def main():
         return
     
     parser = PriceParserWithSheets(excel_file, sheet_name)
-    
+    parser.ensure_site_configs_file()
+
     while True:
         print("\n" + "="*60)
         print("МЕНЮ:")
